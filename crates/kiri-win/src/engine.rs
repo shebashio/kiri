@@ -1016,8 +1016,10 @@ pub fn on_message(msg: &str) {
             sharing::open_k8s(c.name, v["ip"].as_str().unwrap_or_default().to_owned(), port, v["label"].as_str().unwrap_or_default().to_owned(), v["name"].as_str().unwrap_or_default().to_owned());
         }
         "shareusage" => sharing::usage(),
+        "shareconfig" => sharing::cloudflare_settings(c.id, (!c.value.is_null()).then_some(c.value)),
+        "sharecloudflare" => sharing::cloudflare_setup(c.id, c.action, c.value),
         // The account's live tunnels from every computer, and closing one this window didn't open.
-        "sharetunnels" => sharing::tunnels(),
+        "sharetunnels" | "sharelocaltunnels" => sharing::tunnels(c.cmd == "sharetunnels"),
         "sharetraffic" => sharing::traffic(),
         "usage" => {
             std::thread::spawn(|| emit(usage::event()));

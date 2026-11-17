@@ -1649,6 +1649,14 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             sharing::usage();
             Ok(())
         }
+        "shareconfig" => {
+            sharing::cloudflare_settings(msg.id, (!msg.value.is_null()).then_some(msg.value));
+            Ok(())
+        }
+        "sharecloudflare" => {
+            sharing::cloudflare_setup(msg.id, msg.action, msg.value);
+            Ok(())
+        }
         // The account's live tunnels from every computer, and closing one this window didn't open.
         // What the window costs, for the status bar.
         "usage" => {
@@ -1659,8 +1667,8 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             sharing::traffic();
             Ok(())
         }
-        "sharetunnels" => {
-            sharing::tunnels();
+        "sharetunnels" | "sharelocaltunnels" => {
+            sharing::tunnels(msg.cmd == "sharetunnels");
             Ok(())
         }
         "sharestop" => {

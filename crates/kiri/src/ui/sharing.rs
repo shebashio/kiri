@@ -55,7 +55,12 @@ fn session_id(token: &str) -> String {
 
 fn account() -> Value {
     match share::load() {
-        Ok(c) => json!({"type": "shareaccount", "signedIn": c.token.is_some(), "login": c.login, "server": c.server, "session": c.token.as_deref().map(session_id)}),
+        Ok(c) if c.provider == share::Provider::Cloudflare => {
+            json!({"type": "shareaccount", "provider": "cloudflare", "signedIn": false, "baseDomain": c.cloudflare.as_ref().and_then(|c| c.base_domain.as_deref())})
+        }
+        Ok(c) => {
+            json!({"type": "shareaccount", "signedIn": c.token.is_some(), "login": c.login, "server": c.server, "session": c.token.as_deref().map(session_id)})
+        }
         Err(e) => json!({"type": "shareaccount", "signedIn": false, "error": e.to_string()}),
     }
 }
@@ -76,9 +81,83 @@ pub fn list() {
     emit(json!({"type": "shares", "shares": links, "served": served}).to_string());
 }
 
+/// Domain setup never returns credential contents to the page.
+pub fn cloudflare_settings(id: String, input: Option<Value>) {
+    std::thread::spawn(move || {
+        let saved = input.is_some();
+        let result = match input {
+            Some(value) => serde_json::from_value(value).map_err(std::io::Error::other).and_then(share::cloudflare::settings::update),
+            None => share::cloudflare::settings::current(),
+        };
+        match result {
+            Ok(settings) => {
+                emit(json!({"type": "shareconfig", "id": id, "settings": settings, "saved": saved}).to_string());
+                if saved { list(); }
+            }
+            Err(e) => emit(json!({"type": "shareconfig", "id": id, "error": e.to_string()}).to_string()),
+        }
+    });
+}
+
+struct CloudflareSetup {
+    id: String,
+    cancel: std::sync::Arc<AtomicBool>,
+    auth_url: Option<String>,
+}
+static CLOUDFLARE_SETUP: Mutex<Option<CloudflareSetup>> = Mutex::new(None);
+
+pub fn cloudflare_setup(id: String, action: String, value: Value) {
+    let event = |value: Value| {
+        let mut value = value;
+        value["type"] = "sharecloudflare".into(); value["id"] = id.clone().into();
+        emit(value.to_string());
+    };
+    if action == "status" {
+        match share::cloudflare::setup::status(value["base_domain"].as_str().unwrap_or_default()) {
+            Ok(status) => event(json!({"state":"status", "result":status})),
+            Err(e) => event(json!({"state":"error", "error":e.to_string()})),
+        }
+        return;
+    }
+    if action == "cancel" || action == "open" {
+        let mut job = CLOUDFLARE_SETUP.lock().unwrap();
+        if let Some(job) = job.as_mut().filter(|j| j.id == id) {
+            if action == "cancel" { job.cancel.store(true, Ordering::SeqCst); }
+            else if let Some(url) = &job.auth_url { browser(url); }
+        }
+        return;
+    }
+    let cancel = std::sync::Arc::new(AtomicBool::new(false));
+    {
+        let mut job = CLOUDFLARE_SETUP.lock().unwrap();
+        if job.is_some() { event(json!({"state":"error", "error":"Cloudflare setup is already running."})); return; }
+        *job = Some(CloudflareSetup { id: id.clone(), cancel: cancel.clone(), auth_url: None });
+    }
+    std::thread::spawn(move || {
+        let emit_setup = |mut value: Value| { value["type"] = "sharecloudflare".into(); value["id"] = id.clone().into(); emit(value.to_string()); };
+        let result = share::cloudflare::setup::run(&action, &value, &cancel, &mut |event| {
+            if let Some(url) = event["auth_url"].as_str()
+                && let Some(job) = CLOUDFLARE_SETUP.lock().unwrap().as_mut()
+            {
+                job.auth_url = Some(url.to_owned());
+            }
+            emit_setup(event);
+        });
+        *CLOUDFLARE_SETUP.lock().unwrap() = None;
+        match result {
+            Ok(result) => { emit_setup(json!({"state":"done", "result":result})); list(); }
+            Err(e) => emit_setup(json!({"state":if cancel.load(Ordering::SeqCst) {"cancelled"} else {"error"}, "error":e.to_string()})),
+        }
+    });
+}
+
 /// The account's plan and what it has used this month, from the edge.
 pub fn usage() {
     std::thread::spawn(|| {
+        if share::load().is_ok_and(|c| c.provider == share::Provider::Cloudflare) {
+            emit(json!({"type": "shareusage", "unsupported": true}).to_string());
+            return;
+        }
         let v = match share::whoami() {
             Ok(w) => json!({
                 "type": "shareusage", "login": w["login"], "used": w["usage"]["used"], "cap": w["usage"]["cap"],
@@ -199,7 +278,7 @@ fn start(source: String, name: String, resolve: impl FnOnce() -> std::io::Result
                     unforward(m.remove(&id).and_then(|l| l.forward));
                 }
                 Some(s) => {
-                    if let Some(l) = m.get_mut(&id) {
+                    if let Some(l) = m.get_mut(&id).filter(|l| l.state != "stopping") {
                         l.state = match s {
                             "live" => "live",
                             "reconnecting" => "reconnecting",
@@ -218,11 +297,11 @@ fn start(source: String, name: String, resolve: impl FnOnce() -> std::io::Result
             // Unless it already ended, keep the tunnel so Stop can close it.
             Ok(h) => {
                 let leftover = with_links(|m| match m.get_mut(&id) {
-                    Some(l) => {
+                    Some(l) if l.state != "stopping" => {
                         l.handle = Some(h);
                         None
                     }
-                    None => Some(h),
+                    _ => Some(h),
                 });
                 if let Some(h) = leftover {
                     h.stop();
@@ -238,7 +317,12 @@ fn start(source: String, name: String, resolve: impl FnOnce() -> std::io::Result
 
 /// Closes a link; its last event is `ended`.
 pub fn close(id: u64) {
-    let handle = with_links(|m| m.get_mut(&id).and_then(|l| l.handle.take()));
+    let handle = with_links(|m| {
+        m.get_mut(&id).and_then(|l| {
+            l.state = "stopping";
+            l.handle.take()
+        })
+    });
     if let Some(h) = handle {
         std::thread::spawn(move || h.stop());
     }
@@ -248,12 +332,25 @@ pub fn close(id: u64) {
 /// `kiri share` on this computer (the account's tunnels with this machine's
 /// id), so nothing stays public while Kiri is off.
 pub fn close_all() {
-    let handles: Vec<share::Handle> = with_links(|m| m.values_mut().filter_map(|l| l.handle.take()).collect());
+    if let Some(job) = CLOUDFLARE_SETUP.lock().unwrap().as_ref() { job.cancel.store(true, Ordering::SeqCst); }
+    share::cloudflare::close_all();
+    let handles: Vec<share::Handle> = with_links(|m| {
+        m.values_mut()
+            .filter_map(|l| {
+                l.state = "stopping";
+                l.handle.take()
+            })
+            .collect()
+    });
     std::thread::spawn(move || {
         for h in handles {
             h.stop();
         }
-        let Ok(live) = share::tunnels() else { return };
+        let live = match share::tunnels() {
+            Ok(live) => live,
+            Err(e) => { emit(super::notice("error", &e.to_string())); return; }
+        };
+        if let Some(warning) = &live.warning { emit(super::notice("error", warning)); }
         let device = share::load().map(|c| c.device).unwrap_or_default();
         let machine = share::machine_id(&device);
         for t in live.items.iter().filter(|t| (!t.machine.is_empty() && t.machine == machine) || (!t.device.is_empty() && t.device == device)) {
@@ -261,7 +358,7 @@ pub fn close_all() {
                 emit(super::notice("error", &super::trf("Couldn't stop {name}: {error}", &[("name", &t.name), ("error", &e)])));
             }
         }
-        tunnels();
+        tunnels(true);
         list();
     });
 }
@@ -278,13 +375,16 @@ pub fn browse(id: u64) {
 /// for while one was on its way, so a change just made shows.
 static POLLING: AtomicBool = AtomicBool::new(false);
 static AGAIN: AtomicBool = AtomicBool::new(false);
+/// The latest queued poll decides whether to query the remote edge.
+static INCLUDE_EDGE: AtomicBool = AtomicBool::new(true);
 /// The last list's links by tunnel name, the only ones `browse_tunnel` opens.
 static LISTED: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 
-/// Every live tunnel on the account, whichever computer runs it, as
+/// Live links, optionally including the account's remote edge, as
 /// `{"type":"sharetunnels", "items", "limit"}`. Each item says where it
 /// runs (see [`tagged`]); the page colours it by that.
-pub fn tunnels() {
+pub fn tunnels(include_edge: bool) {
+    INCLUDE_EDGE.store(include_edge, Ordering::SeqCst);
     AGAIN.store(true, Ordering::SeqCst);
     if POLLING.swap(true, Ordering::SeqCst) {
         return;
@@ -292,7 +392,8 @@ pub fn tunnels() {
     std::thread::spawn(|| {
         loop {
             AGAIN.store(false, Ordering::SeqCst);
-            emit(tunnels_event(share::tunnels()).to_string());
+            let result = if INCLUDE_EDGE.load(Ordering::SeqCst) { share::tunnels() } else { share::local_tunnels() };
+            emit(tunnels_event(result).to_string());
             POLLING.store(false, Ordering::SeqCst);
             if !AGAIN.load(Ordering::SeqCst) || POLLING.swap(true, Ordering::SeqCst) {
                 break;
@@ -316,13 +417,15 @@ fn tunnels_event(r: std::io::Result<share::LiveTunnels>) -> Value {
             let device = share::load().map(|c| c.device).unwrap_or_default();
             let machine = share::machine_id(&device);
             let own: Vec<String> = with_links(|m| m.values().filter_map(|l| l.url.clone()).collect());
-            let items: Vec<Value> = list.items.iter().map(|t| tagged(t, &machine, &device, &own)).collect();
-            json!({"type": "sharetunnels", "items": items, "limit": list.limit})
+            tunnels_payload(&list, &machine, &device, &own)
         }
-        // An edge from before the list: the page shows its own shares only.
-        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => json!({"type": "sharetunnels", "unsupported": true}),
         Err(e) => json!({"type": "sharetunnels", "error": e.to_string()}),
     }
+}
+
+fn tunnels_payload(list: &share::LiveTunnels, machine: &str, device: &str, own: &[String]) -> Value {
+    let items: Vec<Value> = list.items.iter().map(|t| tagged(t, machine, device, own)).collect();
+    json!({"type": "sharetunnels", "items": items, "limit": list.limit, "unsupported": list.unsupported, "warning": list.warning})
 }
 
 /// A tunnel as the page shows it. `mine`: one of this window's links.
@@ -366,7 +469,7 @@ pub fn stop_tunnel(name: String) {
         if let Err(e) = share::close_tunnel(&name) {
             emit(super::notice("error", &super::trf("Couldn't stop {name}: {error}", &[("name", &name), ("error", &e)])));
         }
-        tunnels();
+        tunnels(true);
     });
 }
 
@@ -458,8 +561,14 @@ mod tests {
 
     #[test]
     fn an_edge_without_the_list_says_so() {
-        let v = tunnels_event(Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "no")));
+        let local = t("https://web.example.com", "mac1", "dev1", "cli", "kiri");
+        let list = share::LiveTunnels { items: vec![local], unsupported: true, ..Default::default() };
+        let v = tunnels_payload(&list, "mac1", "dev1", &[]);
         assert_eq!(v["unsupported"], true);
+        assert_eq!(v["items"][0]["url"], "https://web.example.com");
+        assert_eq!(v["items"][0]["where"], "here");
+        assert!(v["warning"].is_null());
+        assert!(v["error"].is_null());
         let v = tunnels_event(Err(std::io::Error::other("offline")));
         assert_eq!(v["error"], "offline");
     }

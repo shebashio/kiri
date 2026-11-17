@@ -1007,6 +1007,17 @@ td.actions .acts-row { margin-inline-start: auto; width: max-content; padding-in
 .scrim.langstep { z-index: 40; grid-template: minmax(0, 1fr) / minmax(0, 1fr); }
 .dialog { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 20px; width: min(460px, calc(100% - 32px)); display: grid; gap: 14px; }
 .dialog h3 { font-size: var(--fs-head); }
+.dialog.cf-settings { width: min(680px, calc(100% - 32px)); max-height: calc(100% - 32px); overflow: auto; }
+.cf-settings fieldset { border: 0; min-width: 0; display: grid; gap: 12px; }
+.cf-settings label { display: grid; gap: 5px; }
+.cf-settings .field { width: 100%; min-width: 0; }
+.cf-settings select.field { height: 32px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel); color: var(--text); }
+.cf-settings [hidden] { display: none; }
+.cf-route { display: grid; grid-template-columns: minmax(100px, 1fr) minmax(180px, 2fr) auto; gap: 8px; align-items: end; }
+.cf-settings .cf-dns { display: grid; gap: 6px; overflow-wrap: anywhere; user-select: text; }
+.cf-settings [role=alert] { color: var(--red-text); }
+.cf-settings details > :not(summary) { margin-top: 10px; }
+@media (max-width: 560px) { .cf-route { grid-template-columns: minmax(0, 1fr); } }
 .dialog p { color: var(--muted); font-size: var(--fs); }
 /* An alert: what kind it is as a symbol on the left, in its colour, centred on
    the title's first line; the words and buttons line up beside it. */
@@ -6780,6 +6791,8 @@ window.kiri = {
       case "enginestale": ui.engineStale = e.version; ui.staleHidden = false; renderUpdate(); break;
       case "tools": toolsBar(e); break;
       case "share": case "shares": case "shareaccount": case "sharelogin": case "shareusage": case "sharetunnels": case "sharetraffic": shEvent(e); break;
+      case "shareconfig": shDomainResult(e); break;
+      case "sharecloudflare": shCloudflareResult(e); break;
       case "builds": {
         const b = ui.bl;
         b.items = e.builds || b.items || []; b.error = e.error || "";
@@ -7588,7 +7601,7 @@ function kStart(key) {
   if (K8S_VIEWS.has(ui.view)) render();
 }
 function kShare(key) {
-  if (sh.account?.signedIn) return kStart(key);
+  if (shAvailable()) return kStart(key);
   sh.pending = key;
   shSignin();
 }
@@ -7906,7 +7919,8 @@ const shOthers = () => (sh.remote?.items || []).filter((x) => !x.mine && !sh.sto
 const shCli = () => shOthers().filter((x) => x.where === "here");
 const shExt = () => shOthers().filter((x) => x.where !== "here");
 const shInUse = () => shLive().length + shOthers().length;
-const shLimit = () => sh.remote?.limit ?? sh.usage?.tunnels ?? null;
+// A mixed list is not a Kiri Cloud plan total.
+const shLimit = () => shCloudflare() || (sh.remote?.items || []).some((x) => x.name.startsWith("cloudflare:")) ? null : sh.remote?.limit ?? sh.usage?.tunnels ?? null;
 const shUp = (x) => shFor2(Date.now() - (x.started || 0) * 1000);
 const shBare = (url) => (url || "").replace(/^https:\/\//, "");
 const shPortOf = (target) => (target || "").match(/:(\d+)\)?$/)?.[1] || "";
@@ -7917,24 +7931,26 @@ const shWhere = (x) => tr("{program} on {host}", { program: x.program || (x.kind
 const shTag = (x) => `<span class="cli-tag">${x.kind === "cli" ? "CLI" : esc(x.program || "Kiri")}</span>`;
 const shExtTag = { toString: () => `<span class="ext-tag">${tr("External")}</span>` };
 
-function shPoll() { if (sh.account?.signedIn && !sh.remoteOff) send("sharetunnels"); }
-/* Polls while signed in; signed out, there's nothing to show. */
+const shCloudflare = () => sh.account?.provider === "cloudflare";
+const shAvailable = () => shCloudflare() || !!sh.account?.signedIn;
+function shPoll() { send(sh.remoteOff ? "sharelocaltunnels" : "sharetunnels"); }
+/* Local Cloudflare links remain discoverable without a Kiri Cloud sign-in. */
 function shPolling() {
-  const on = !!sh.account?.signedIn && !sh.remoteOff;
+  const on = !!sh.account;
   if (on && !sh.poll) { sh.poll = setInterval(shPoll, SH_POLL); shPoll(); }
   else if (!on && sh.poll) { clearInterval(sh.poll); sh.poll = 0; }
-  if (!sh.account?.signedIn) sh.remote = null;
 }
 /* The list arrived. Returns whether anything shown changed. */
 function shRemote(e) {
-  const was = JSON.stringify(sh.remote);
-  if (e.unsupported) { sh.remoteOff = true; sh.remote = null; shPolling(); }
-  else if (!e.error) {
-    sh.remote = { items: e.items || [], limit: e.limit ?? null };
+  const was = JSON.stringify([sh.remote, sh.remoteOff]);
+  if (!e.error) {
+    sh.remoteOff = !!e.unsupported;
+    // A poll started before a provider switch may carry a stale Kiri warning.
+    sh.remote = { items: e.items || [], limit: e.limit ?? null, warning: shCloudflare() ? null : e.warning || null };
     for (const n of sh.stopping) if (!sh.remote.items.some((x) => x.name === n)) sh.stopping.delete(n);
   }
   if (sh.cap) shCapToast();
-  return JSON.stringify(sh.remote) !== was;
+  return JSON.stringify([sh.remote, sh.remoteOff]) !== was;
 }
 /* `kiri share` on this computer sharing one of this container's published ports, or the container by name. */
 function shCliFor(c, name) {
@@ -8035,16 +8051,17 @@ function shStopExt(name) {
 function shEvent(e) {
   let remote = false;
   if (e.type === "shareaccount") {
+    if (sh.account?.provider !== e.provider || sh.account?.signedIn !== e.signedIn || sh.account?.session !== e.session || sh.account?.server !== e.server) { sh.remoteOff = false; sh.remote = null; sh.usage = null; }
     sh.account = e;
     shPolling();
-    if (e.signedIn) {
+    if (shAvailable()) {
       sh.login = null; $("sh-signin")?.remove();
       if (sh.pending) { (kParse(sh.pending) ? kStart : shStart)(sh.pending); sh.pending = null; }
       send("shareusage");
     }
   } else if (e.type === "sharelogin") {
     if (e.error) { sh.login = null; $("sh-signin")?.remove(); toast("error", tr("Sign-in failed: {error}", { error: e.error })); } else { sh.login = { code: e.code, uri: e.uri }; shSignin(); }
-  } else if (e.type === "shareusage") { if (!e.error) sh.usage = e; }
+  } else if (e.type === "shareusage") { if (e.unsupported) sh.usage = null; else if (!e.error) sh.usage = e; }
   /* What each `kiri share` here has served, from its traffic file: the
      bars take what's new since the last look. */
   else if (e.type === "sharetraffic") {
@@ -8274,10 +8291,10 @@ function renderShare() {
   const stat = (icon, k, v, s, extra = "") => `<div class="sh-stat"><div class="k"><svg class="i" viewBox="0 0 256 256"><path d="${PH[icon]}"/></svg>${k}</div><div class="v">${v}</div><div class="s">${s}</div>${extra}</div>`;
   const stats = `<div class="sh-stats">
     ${stat("globe", tr("Shared now"), now.v, now.s, now.slots)}
-    ${stat("updown", tr("Traffic served"), size(served.out),
+    ${shCloudflare() ? stat("updown", tr("Traffic served"), "—", tr("Cloudflare does not provide request logs in Kiri")) : stat("updown", tr("Traffic served"), size(served.out),
       served.requests ? `${trn(served.requests, "{n} request", "{n} requests")} · ${tr("{size} received", { size: size(served.in) })}` : tr("No requests yet"),
       shWave(sh.wave, 34, `aria-label="${tr("Traffic over the last two minutes")}"`, tr("No visitors in the last 2 minutes")))}
-    ${u ? shMonth(u, capped, pct) : stat("clock", tr("This month"), "—", a?.signedIn ? tr("Checking your plan…") : tr("Sign in to see your plan"))}
+    ${shCloudflare() ? stat("globe", tr("Base domain"), esc(a.baseDomain || "trycloudflare.com"), a.baseDomain ? tr("Named tunnels") : tr("Temporary links")) : u ? shMonth(u, capped, pct) : stat("clock", tr("This month"), "—", a?.signedIn ? tr("Checking your plan…") : tr("Sign in to see your plan"))}
   </div>`;
   const ext = shExt();
   const rows = items.map(shRow).join("") + shCli().map(shCliRow).join("")
@@ -8285,13 +8302,13 @@ function renderShare() {
   const list = rows ? `<div class="sh-list">${rows}</div>`
     : `<div class="sh-empty">${shGlobe}<h3>${tr("Nothing shared yet")}</h3><p>${tr("Press <b>Share</b> on a running container to give it a public https link anyone can open.")}</p>
         <button class="btn" data-shcontainers>${tr("Go to Containers")}</button></div>`;
-  const foot = !a ? "" : a.signedIn
+  const foot = !a ? "" : shCloudflare() ? `<div class="sh-foot">${tr("Cloudflare Tunnel")} · ${tr("Links on this computer")}<button class="linkish" data-shdomain>${tr("Custom domain")}</button></div>` : a.signedIn
     ? `<div class="sh-foot"><span class="sh-ghmark" title="${tr("Signed in with GitHub")}">${shSvg("github")}</span>${tr("Signed in to Kiri Cloud with GitHub as {login}", { login: `<b>${esc(a.login || tr("you"))}</b>` })}
         ${a.session ? `<span class="sep">·</span><span title="${tr("This sign-in's ID: a hash of its token, safe to quote when asking for help")}">${tr("Session")} <code class="sh-sess">${esc(a.session)}</code></span>` : ""}
         <span class="sep">·</span><button class="linkish" data-shlogout>${tr("Sign out")}</button></div>`
     : `<div class="sh-foot">${tr("Not signed in")}<button class="linkish" data-shlogin>${tr("Sign in with GitHub")}</button></div>`;
-  const intro = `<p class="sh-intro">${tr("Share gives a container or a Kubernetes service a public https link through a secure tunnel to Kiri Cloud.")} ${a?.signedIn && !sh.remoteOff ? tr("This lists every link on your account, on any computer.") : tr("It stays up while Kiri is running.")}</p>`;
-  morph($("content"), `<div class="sh">${intro}${stats}${list}${foot}</div>`);
+  const intro = shCloudflare() ? `<p class="sh-intro">${tr("Share gives a container or a Kubernetes service a public https link through Cloudflare Tunnel.")} ${tr("It stays up while Kiri is running.")}</p>` : `<p class="sh-intro">${tr("Share gives a container or a Kubernetes service a public https link through a secure tunnel to Kiri Cloud.")} ${a?.signedIn && !sh.remoteOff ? tr("This lists every link on your account, on any computer.") : tr("It stays up while Kiri is running.")}</p>`;
+  morph($("content"), `<div class="sh">${intro}${sh.remote?.warning ? `<p class="err">${esc(sh.remote.warning)}</p>` : ""}${stats}${list}${foot}</div>`);
 }
 /* Puts `html` in `el` changing only what differs, so a redraw doesn't restart
    animations, repaint icons or flash a hover. Rows are matched by what they
@@ -8338,7 +8355,7 @@ function shHealth(it) {
   else if (it.state === "live") bits.push(tr("{live} for {time}", { live: `<span class="ok">● ${tr("Live")}</span>`, time: shFor2(Date.now() - (it.liveAt || Date.now())) }));
   else if (it.state === "reconnecting") bits.push(`<span class="warn">${tr("Reconnecting")}</span>${it.reason ? `: ${esc(it.reason)}` : ""}`);
   if (it.reconnects) bits.push(tr("reconnected {n}×", { n: it.reconnects }));
-  if (it.rate) bits.push(tr("{rate}/s limit", { rate: size(it.rate) })); else if (it.state === "live") bits.push(tr("no speed limit"));
+  if (it.rate) bits.push(tr("{rate}/s limit", { rate: size(it.rate) })); else if (it.state === "live" && !shCloudflare()) bits.push(tr("no speed limit"));
   if (it.remaining != null && it.remaining < 2 ** 53) bits.push(tr("{size} left this month", { size: size(it.remaining) }));
   const addr = (it.target || "").match(/\(([^)]+)\)/)?.[1];
   const notes = [];
@@ -8399,11 +8416,163 @@ function shPaneRows(id) {
   const all = it.recent || [], q = (sh.q || "").trim().toLowerCase(), st = sh.st || "";
   const rows = all.filter((r) => (!st || String(r.status).startsWith(st)) && (!q || `${r.status} ${r.method} ${r.path}`.toLowerCase().includes(q)));
   const errs = all.filter((r) => r.status >= 400).length, avg = all.length ? Math.round(all.reduce((a, r) => a + r.ms, 0) / all.length) : 0;
-  $("sh-onestats").innerHTML = `<span>${tr("{size} served", { size: `<b>${size(it.out || 0)}</b>` })}</span><span>${tr("{ms} average", { ms: `<b>${avg} ms</b>` })}</span><span>${trn(errs, "{n} error", "{n} errors", { n: `<b>${errs}</b>` })}</span>`;
+  $("sh-onestats").innerHTML = shCloudflare() ? esc(tr("Cloudflare does not provide request logs in Kiri")) : `<span>${tr("{size} served", { size: `<b>${size(it.out || 0)}</b>` })}</span><span>${tr("{ms} average", { ms: `<b>${avg} ms</b>` })}</span><span>${trn(errs, "{n} error", "{n} errors", { n: `<b>${errs}</b>` })}</span>`;
   $("sh-count").textContent = q || st ? tr("{n} of {total}", { n: rows.length, total: all.length }) : trn(all.length, "{n} request", "{n} requests");
   $("sh-rows").innerHTML = rows.length ? rows.slice(0, 500).map((r) => `<tr><td class="muted mono">${shClock(r.at)}</td><td class="mono ${shCode(r.status)}">${r.status || "—"}</td><td class="mono"><b>${esc(r.method)}</b></td>
       <td class="mono sh-path" title="${esc(r.path)}">${esc(r.path)}</td><td class="r num muted">${size(r.out)}</td><td class="r num">${r.ms} ms</td></tr>`).join("")
-    : `<tr><td colspan="6" class="muted sh-noreq">${it.paused ? tr("Paused: nobody can open the link until you resume.") : all.length ? tr("No requests match.") : tr("Waiting for the first visitor…")}</td></tr>`;
+    : `<tr><td colspan="6" class="muted sh-noreq">${it.paused ? tr("Paused: nobody can open the link until you resume.") : shCloudflare() ? tr("Cloudflare does not provide request logs in Kiri") : all.length ? tr("No requests match.") : tr("Waiting for the first visitor…")}</td></tr>`;
+}
+
+/* Cloudflare domain setup. The host imports credentials and returns only
+   their path and tunnel ID; the page never reads their secret contents. */
+let shDomain = null, shDomainSeq = 0;
+function shDomainClose() {
+  const focus = shDomain?.focus;
+  if (shDomain?.setupBusy) send("sharecloudflare", { id: shDomain.setupId, action: "cancel" });
+  if (shDomain?.onKey) document.removeEventListener("keydown", shDomain.onKey);
+  $("sh-domain")?.remove(); shDomain = null;
+  if (focus?.isConnected) focus.focus();
+}
+function shDomainRequest(value) {
+  if (!shDomain || shDomain.busy) return;
+  shDomain.id = String(++shDomainSeq); shDomain.busy = true;
+  const fields = $("sh-domain")?.querySelector("[data-cf-form]");
+  if (fields) fields.disabled = true;
+  send("shareconfig", { id: shDomain.id, ...(value === undefined ? {} : { value }) });
+}
+function shDomainOpen() {
+  shDomainClose();
+  shDomain = { focus: document.activeElement, busy: false };
+  const scrim = document.createElement("div");
+  scrim.id = "sh-domain"; scrim.className = "scrim sh-scrim";
+  scrim.innerHTML = `<div class="dialog cf-settings" role="dialog" aria-modal="true" aria-labelledby="cf-title">
+    <h3 id="cf-title">${tr("Cloudflare custom domain")}</h3><div id="cf-body"><p>${tr("Loading…")}</p></div>
+    <p id="cf-error" role="alert"></p><p id="cf-status" role="status"></p>
+    <div id="cf-progress" hidden><button class="btn" data-cf-browser hidden>${tr("Open Cloudflare")}</button> <button class="btn" data-cf-cancel>${tr("Cancel setup")}</button></div>
+    <div class="row-end"><span></span><button class="btn" data-cf-close>${tr("Done")}</button></div></div>`;
+  document.body.append(scrim);
+  shDomain.onKey = (ev) => {
+    if (ev.key === "Escape") { ev.preventDefault(); shDomainClose(); }
+    else if (ev.key === "Tab") {
+      const focusable = [...scrim.querySelectorAll("button, input, select")].filter(x => !x.matches(":disabled") && x.getClientRects().length);
+      const first = focusable[0], last = focusable.at(-1);
+      if (ev.shiftKey && document.activeElement === first) { ev.preventDefault(); last?.focus(); }
+      else if (!ev.shiftKey && document.activeElement === last) { ev.preventDefault(); first?.focus(); }
+    }
+  };
+  document.addEventListener("keydown", shDomain.onKey);
+  scrim.addEventListener("click", ev => {
+    // Returning from browser authorization can click the backdrop. Only an
+    // explicit close or cancel should stop an active setup.
+    if ((ev.target === scrim && !shDomain.setupBusy) || ev.target.closest("[data-cf-close]")) return shDomainClose();
+    if (ev.target.closest("[data-cf-browser]")) return send("sharecloudflare", { id: shDomain.setupId, action: "open" });
+    if (ev.target.closest("[data-cf-cancel]")) { send("sharecloudflare", { id: shDomain.setupId, action: "cancel" }); $("cf-status").textContent = tr("Cancelling…"); return; }
+    if (shDomain.busy) return;
+    if (ev.target.closest("[data-cf-connect]")) return shCloudflareStart("connect");
+    if (ev.target.closest("[data-cf-create]")) return shCloudflareStart("create");
+    if (ev.target.closest("[data-cf-save], [data-cf-quick]")) return shDomainSave();
+    if (ev.target.closest("[data-cf-add]")) {
+      $("cf-routes").insertAdjacentHTML("beforeend", shDomainRow({}));
+      $("cf-routes").lastElementChild.querySelector("input").focus();
+    } else ev.target.closest("[data-cf-remove]")?.closest(".cf-route")?.remove();
+  });
+  scrim.addEventListener("change", ev => {
+    if (ev.target.id === "cf-mode") shDomainMode();
+    if (ev.target.id === "cf-base") shCloudflareStatus();
+  });
+  scrim.addEventListener("submit", ev => {
+    ev.preventDefault();
+    if ($("cf-mode").value === "custom") shCloudflareStart("create"); else shDomainSave();
+  });
+  scrim.querySelector("[data-cf-close]").focus();
+  shDomainRequest();
+}
+function shDomainSave() {
+  if (!shDomain || shDomain.busy) return;
+  const custom = $("cf-mode").value === "custom", scrim = $("sh-domain");
+  if (custom && (!$("cf-base").reportValidity() || [...scrim.querySelectorAll(".cf-route input")].some(x => !x.reportValidity()))) return;
+  const routes = custom ? [...scrim.querySelectorAll(".cf-route")].map(row => ({ name: row.querySelector("[data-cf-name]").value.trim(), credentials_file: row.querySelector("[data-cf-file]").value.trim() })) : [];
+  $("cf-error").textContent = ""; $("cf-status").textContent = tr("Saving…");
+  shDomainRequest({ base_domain: custom ? $("cf-base").value.trim() : null, routes });
+}
+function shCloudflareStatus() {
+  if (!shDomain || !$("cf-base")) return;
+  shDomain.statusId = String(++shDomainSeq);
+  send("sharecloudflare", { id: shDomain.statusId, action: "status", value: { base_domain: $("cf-base").value.trim() } });
+}
+function shCloudflareStart(action) {
+  if (!shDomain || shDomain.busy || !$("cf-base").reportValidity() || (action === "create" && !$("cf-name").reportValidity())) return;
+  shDomain.setupId = String(++shDomainSeq); shDomain.busy = true; shDomain.setupBusy = true;
+  $("sh-domain").querySelector("[data-cf-form]").disabled = true;
+  $("cf-error").textContent = ""; $("cf-status").textContent = tr("Connecting to Cloudflare…");
+  $("cf-progress").hidden = false; $("sh-domain").querySelector("[data-cf-browser]").hidden = true;
+  send("sharecloudflare", { id: shDomain.setupId, action, value: { base_domain: $("cf-base").value.trim(), name: $("cf-name").value.trim() } });
+}
+function shCloudflareResult(e) {
+  if (!shDomain) return;
+  if (e.state === "status" && e.id === shDomain.statusId) {
+    if ($("cf-auth-note")) $("cf-auth-note").textContent = e.result.certificate_available ? tr("Authorization saved for this domain. Reconnect if you need to authorize it again.") : tr("Connect in your browser and authorize this domain. Kiri will handle the tunnel and DNS.");
+    return;
+  }
+  if (e.id !== shDomain.setupId) return;
+  if (["done", "error", "cancelled"].includes(e.state)) {
+    shDomain.busy = false; shDomain.setupBusy = false; $("cf-progress").hidden = true;
+    $("sh-domain").querySelector("[data-cf-form]").disabled = false;
+    if (e.state === "done") {
+      if (e.result.settings) shDomainResult({ id: shDomain.id, settings: e.result.settings });
+      $("cf-status").textContent = e.result.hostname ? tr("Ready: https://{hostname}. Press Share on the container to open its public link.", { hostname: e.result.hostname }) : tr("Connected. Choose a share name and create its public address.");
+      shCloudflareStatus(); send("shares");
+    } else { $("cf-error").textContent = e.error || tr("Cloudflare setup failed. Try again."); $("cf-status").textContent = ""; }
+  } else {
+    $("cf-status").textContent = e.message || "";
+    if (e.auth_url) $("sh-domain").querySelector("[data-cf-browser]").hidden = false;
+  }
+}
+function shDomainRow(r) {
+  return `<div class="cf-route"><label>${tr("Share name")}<input class="field" data-cf-name required placeholder="web" value="${esc(r.name || "")}" autocapitalize="none" spellcheck="false"></label>
+    <label>${tr("Credentials file")}<input class="field" data-cf-file required placeholder="~/.cloudflared/tunnel-uuid.json" value="${esc(r.credentials_file || "")}" spellcheck="false"></label>
+    <button class="btn" type="button" data-cf-remove aria-label="${tr("Remove tunnel route")}">${tr("Remove")}</button></div>`;
+}
+function shDomainMode() {
+  const custom = $("cf-mode").value === "custom";
+  $("cf-named").hidden = !custom; $("cf-named").disabled = !custom;
+  $("cf-quick-note").hidden = custom;
+  $("sh-domain").querySelector("[data-cf-quick]").hidden = custom;
+}
+function shDomainResult(e) {
+  if (!shDomain || e.id !== shDomain.id) return;
+  shDomain.busy = false;
+  const fields = $("sh-domain").querySelector("[data-cf-form]");
+  if (fields) fields.disabled = false;
+  $("cf-error").textContent = e.error || ""; $("cf-status").textContent = "";
+  if (e.error) return;
+  const s = e.settings, routes = s.routes || [], custom = s.base_domain != null;
+  const running = ui.containers.find(c => c.State === "running");
+  const suggested = routes[0]?.name || (running ? cname(running) : "web");
+  $("cf-body").innerHTML = `<form novalidate><fieldset data-cf-form>
+    <p>${tr("Connect your Cloudflare account, choose a public address, and Kiri creates the tunnel and DNS record for you.")}</p>
+    <label>${tr("Link type")}<select class="field" id="cf-mode"><option value="quick"${custom ? "" : " selected"}>${tr("Temporary links")}</option><option value="custom"${custom ? " selected" : ""}>${tr("Custom domain")}</option></select></label>
+    <p id="cf-quick-note">${tr("Saving temporary links removes Kiri's saved domain routes. Your credentials and Cloudflare resources are kept.")}</p>
+    <fieldset id="cf-named"><label>${tr("Base domain")}<input class="field" id="cf-base" required placeholder="example.com" value="${esc(s.base_domain || "")}" autocapitalize="none" spellcheck="false"></label>
+      <label>${tr("Share name")}<input class="field" id="cf-name" required placeholder="web" value="${esc(suggested)}" autocapitalize="none" spellcheck="false"></label>
+      <p>${tr("A share named web uses web.example.com. Use the container's name to share it from the app.")}</p>
+      <p id="cf-auth-note">${tr("Connect in your browser and authorize this domain. Kiri will handle the tunnel and DNS.")}</p>
+      <div><button class="btn" type="button" data-cf-connect>${tr("Connect Cloudflare")}</button> <button class="btn primary" type="button" data-cf-create>${tr("Create public address")}</button></div>
+      <p>${tr("Creating an address adds a tunnel and DNS record to your Cloudflare account. It becomes public when you press Share on the container.")}</p>
+      <p>${tr("Nested subdomains may need an additional Cloudflare edge certificate.")}</p>
+      ${routes.length ? `<div class="cf-dns"><p>${tr("Configured addresses")}</p>${routes.map(r => `<code>https://${esc(r.hostname || "")}</code>`).join("")}</div>` : ""}
+      <details id="cf-advanced"><summary>${tr("Advanced: import or edit tunnel routes")}</summary>
+        <p>${tr("For tunnels you manage yourself. Removing a local route keeps its Cloudflare tunnel and DNS record.")}</p>
+        <div id="cf-routes">${routes.map(shDomainRow).join("")}</div><button class="btn" type="button" data-cf-add>${tr("Add tunnel")}</button>
+        <button class="btn" type="button" data-cf-save>${tr("Save imported routes")}</button>
+        ${routes.length ? `<div class="cf-dns"><p>${tr("Imported tunnels need a proxied CNAME for each hostname:")}</p>${routes.map(r => `<code>${esc(r.hostname || "")} → ${esc(r.dns_target || "")}</code>`).join("")}</div>` : ""}
+      </details>
+    </fieldset><button class="btn" type="button" data-cf-quick>${tr("Use temporary links")}</button>
+    </fieldset></form>`;
+  shDomainMode();
+  if (e.saved) { $("cf-status").textContent = tr("Saved. Settings apply to new shares. DNS records must be configured separately."); send("shares"); }
+  $("cf-mode").focus();
+  shCloudflareStatus();
 }
 
 /* Signing in, when Share is pressed without an account: GitHub's device code. */
@@ -8517,7 +8686,7 @@ function shCardOne(it) {
   // Visitors → Kiri Cloud → the container: a dot travels along for each request.
   const flow = `<div class="sh-flow" aria-hidden="true">
       ${node(shSvg("globe"), tr("Visitors"))}
-      <div class="sh-lane"></div>${node(KIRI_MARK, "Kiri Cloud", "kiri")}<div class="sh-lane"></div>
+      <div class="sh-lane"></div>${shCloudflare() ? node(shSvg("globe"), "Cloudflare") : node(KIRI_MARK, "Kiri Cloud", "kiri")}<div class="sh-lane"></div>
       ${node(kShTile(it) || (c ? tile(c.icon, "cube") : `<div class="tile">${shGlobe}</div>`), `${esc(kShName(it))}${port ? `<em>:${port}</em>` : ""}`)}</div>`;
   return `<div class="dialog sh-dlg" role="dialog" aria-modal="false" aria-labelledby="sh-dlg-t">
     <button class="sh-x" data-close aria-label="${tr("Hide")}">×</button>
@@ -8527,7 +8696,7 @@ function shCardOne(it) {
     ${host ? `<div class="sh-linkbox">${shSvg("link")}<span title="${esc(it.url)}">${esc(host)}</span>
       <button class="btn sm" data-mcopy>${tr("Copy")}</button><button class="btn sm" data-mopen>${tr("Open")}</button></div>` : ""}
     ${live && it.warning ? `<p class="sh-popnote">${shSvg("info")}${tr("Browsers see a short Kiri Cloud notice page first.")}<button class="linkish" data-mnotice title="${SH_NOTICE_URL}">${tr("See it ↗")}</button></p>` : ""}
-    ${live ? `<div class="sh-feed" id="sh-feed">${shFeed(it, 4)}</div>` : ""}
+    ${live && !shCloudflare() ? `<div class="sh-feed" id="sh-feed">${shFeed(it, 4)}</div>` : ""}
     <div class="sh-dlg-foot"><button class="linkish danger" data-mstop>${tr("Stop sharing")}</button><span class="spacer"></span>
       <button class="linkish" data-mall>${tr("Details")}</button><button class="btn primary sm" data-close>${tr("Done")}</button></div></div>`;
 }
@@ -8589,7 +8758,7 @@ function shStart(name) {
 }
 
 function shShare(name) {
-  if (sh.account?.signedIn) return shStart(name);
+  if (shAvailable()) return shStart(name);
   sh.pending = name;
   shSignin();
 }
@@ -8689,6 +8858,7 @@ function shClicks(ev) {
   else if ((el = t("[data-kgoto]"))) { const k = kParse(el.dataset.kgoto); sh.open = null; show(k.kind === "service" ? "services" : "pods"); (k.kind === "service" ? openSvc : openPod)(`${k.ns}/${k.name}`); }
   else if ((el = t("[data-shcli]"))) shCard("list");
   else if (ui.view !== "share") return;
+  else if (t("[data-shdomain]")) shDomainOpen();
   else if ((el = t("[data-shbrowse]"))) send("sharebrowse", { name: el.dataset.shbrowse });
   else if ((el = t("[data-shkill]"))) shKill(el.dataset.shkill);
   else if ((el = t("[data-shext]"))) shStopExt(el.dataset.shext);
