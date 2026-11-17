@@ -33,6 +33,44 @@ Add `--arch arm64` to any of the three for Windows on Arm
 (`target/kiri-windows-aarch64`, `Kiri-<version>-arm64.msi`); testing it in
 a VM on a Mac is in [docs/testing-windows-arm.md](docs/testing-windows-arm.md).
 
+### Native Linux and Windows builds
+
+The `Native builds` GitHub Actions workflow compiles on Linux and Windows,
+on both x64 and ARM64 hosts. Each job builds release binaries, runs the
+sharing unit tests, and exercises the real CLI and subprocess supervisor
+against a local cloudflared fixture. No Cloudflare account is needed.
+
+On Ubuntu 24.04, install Rust and the desktop development libraries:
+
+```sh
+sudo apt-get install build-essential pkg-config libwebkit2gtk-4.1-dev
+cargo build --release --locked -p kiri -p kiri-init --features kiri/window
+```
+
+This produces `target/release/kiri` (including `kiri ui`) and `kiri-init`.
+The desktop binary needs GTK 3 and WebKitGTK 4.1 at runtime. For an engine
+without desktop dependencies, omit `--features kiri/window`; Linux release
+packaging uses a separate static musl engine build.
+
+On Windows, install Rust's native MSVC toolchain and Visual Studio's C++
+build tools, including the Windows SDK. Windows on Arm also needs LLVM
+(ring's assembly build uses clang). Then run:
+
+```powershell
+cargo build --release --locked -p kiri -p kiri-win
+```
+
+This produces `target/release/kiri.exe` and `kiri-win.exe`. Cloudflare sharing
+runs on Windows itself; the container engine still needs the WSL2 bundle
+described above. `cloudflared` is a separate runtime prerequisite on both
+platforms; see [Cloudflare sharing](cloudflare-sharing.md).
+
+Successful workflow runs attach `kiri-linux-x64`, `kiri-linux-arm64`,
+`kiri-windows-x64`, and `kiri-windows-arm64` artifacts. They contain unsigned
+development binaries and license files, not installers or complete Windows
+bundles. These checks validate native compilation and sharing lifecycle;
+interactive desktop, WSL2/container, and installer tests are separate.
+
 ## Use
 
 ```sh

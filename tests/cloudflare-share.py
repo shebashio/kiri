@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Exercise the real CLI/helper with a fake cloudflared; no public network.
 
-python3 tests/cloudflare-share.py target/debug/kiri
+cargo build --locked -p kiri --example fake-cloudflared
+python3 tests/cloudflare-share.py target/debug/kiri target/debug/examples/fake-cloudflared
 """
 import json
 import http.server
@@ -10,6 +11,7 @@ import os
 from pathlib import Path
 import queue
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -17,53 +19,7 @@ import threading
 import time
 
 BINARY = str(Path(sys.argv[1]).resolve())
-FAKE = r'''
-import http.server, json, os, pathlib, sys, time, uuid
-args = sys.argv[1:]
-arg = lambda name: args[args.index(name) + 1]
-root = pathlib.Path(os.environ["KIRI_CF_TEST"])
-config = pathlib.Path(arg("--config"))
-runtime = config.parent
-if "--origincert" in args:
-    command = args[args.index("--origincert") + 2:]
-    cert = pathlib.Path(arg("--origincert"))
-    assert cert == pathlib.Path(os.environ["HOME"]) / ".cloudflared/cert.pem"
-    (root / ("setup-" + str(os.getpid()) + ".json")).write_text(json.dumps({"pid":os.getpid(), "command":command, "runtime":str(runtime), "home":os.environ["HOME"], "token":os.environ.get("TUNNEL_TOKEN"), "force_dns":os.environ.get("TUNNEL_FORCE_PROVISIONING_DNS")}))
-    if command[0] == "login":
-        print("https://dash.cloudflare.com.evil.example/argotunnel?callback=wrong", file=sys.stderr, flush=True)
-        print("https://dash.cloudflare.com/argotunnel?aud=&callback=https%3A%2F%2Flogin.cloudflareaccess.org%2Ftest", file=sys.stderr, flush=True)
-        while (root / "hold_login").exists(): time.sleep(.05)
-        cert.write_text("fake-account-secret-must-not-leak")
-    elif command[0] == "list":
-        assert cert.is_file()
-    elif command[0] == "create":
-        pathlib.Path(arg("--credentials-file")).write_text(json.dumps({"TunnelID":str(uuid.uuid4()), "TunnelSecret":"fake-tunnel-secret-must-not-leak"}))
-    elif command[:2] == ["route", "dns"]:
-        assert "--overwrite-dns" not in args
-        if (root / "fail_dns").exists():
-            print("fake-account-secret-must-not-leak", file=sys.stderr, flush=True)
-            sys.exit(7)
-        hostname = command[-1] + (".other.net" if (root / "wrong_zone").exists() else "")
-        print(json.dumps({"message":f"Added CNAME {hostname} which will route to this tunnel"}), file=sys.stderr, flush=True)
-    else: raise AssertionError(command)
-    sys.exit(0)
-(root / (str(os.getpid()) + ".json")).write_text(json.dumps({"pid":os.getpid(), "args":args, "config":json.loads(config.read_text()), "token":os.environ.get("TUNNEL_TOKEN"), "runtime":str(runtime)}))
-if (root / "fail").exists():
-    print(json.dumps({"message":"private-token-must-not-leak"}), file=sys.stderr, flush=True)
-    sys.exit(7)
-class Handler(http.server.BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-    def do_GET(self):
-        self.send_response(503 if (root / "offline").exists() else 200)
-        self.end_headers()
-    def log_message(self, *args): pass
-server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
-print(json.dumps({"message":f"Starting metrics server on 127.0.0.1:{server.server_port}/metrics"}), file=sys.stderr, flush=True)
-if "--url" in args:
-    print(json.dumps({"message":"| https://test-river.trycloudflare.com |"}), file=sys.stderr, flush=True)
-pathlib.Path(arg("--pidfile")).write_text(str(os.getpid()))
-server.serve_forever()
-'''
+FIXTURE = str(Path(sys.argv[2]).resolve())
 
 
 def eventually(fn, timeout=8):
@@ -76,11 +32,40 @@ def eventually(fn, timeout=8):
 
 
 def alive(pid):
+    if os.name == "nt":
+        # os.kill(pid, 0) terminates processes on Windows. Query a handle instead.
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel.WaitForSingleObject.restype = wintypes.DWORD
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+        if not handle:
+            error = ctypes.get_last_error()
+            if error == 87:  # ERROR_INVALID_PARAMETER: PID no longer exists
+                return False
+            raise ctypes.WinError(error)
+        try:
+            return kernel.WaitForSingleObject(handle, 0) == 258  # WAIT_TIMEOUT
+        finally:
+            kernel.CloseHandle(handle)
     try:
         os.kill(pid, 0)
         return True
     except ProcessLookupError:
         return False
+
+
+def interrupt(process):
+    if os.name == "nt":
+        # CI has no interactive console. Terminate the owner and verify the
+        # detached helper still reaps its child on stdin EOF.
+        process.terminate()
+    else:
+        os.killpg(process.pid, signal.SIGINT)
 
 
 class Share:
@@ -116,8 +101,8 @@ class Share:
 def main():
     with tempfile.TemporaryDirectory(prefix="kiri-cf-test-") as temp:
         root = Path(temp)
-        fake = root / "cloudflared"
-        fake.write_text("#!" + sys.executable + "\n" + FAKE)
+        fake = root / ("cloudflared.exe" if os.name == "nt" else "cloudflared")
+        shutil.copyfile(FIXTURE, fake)
         fake.chmod(0o700)
         config = root / "share.json"
         env = {**os.environ, "KIRI_SHARE_CONFIG": str(config), "KIRI_CF_TEST": temp,
@@ -263,10 +248,10 @@ def main():
             share = start()
             share.event("live")
             capture = next(c for c in captures() if c["pid"] not in before)
-            os.killpg(share.process.pid, signal.SIGINT)
+            interrupt(share.process)
             share.process.wait(timeout=5)
             closed(capture)
-            print("PASS terminal Ctrl+C reaps cloudflared and removes runtime files")
+            print("PASS owner termination reaps cloudflared and removes runtime files" if os.name == "nt" else "PASS terminal Ctrl+C reaps cloudflared and removes runtime files")
 
             before = {c["pid"] for c in captures()}
             share = start()
@@ -275,7 +260,7 @@ def main():
             share.process.kill()
             share.process.wait(timeout=5)
             closed(capture)
-            print("PASS parent SIGKILL closes and reaps cloudflared")
+            print("PASS forced parent termination closes and reaps cloudflared")
 
             before = {c["pid"] for c in captures()}
             (root / "offline").touch()
@@ -304,7 +289,7 @@ def main():
             assert saved["provider"] == "cloudflare"
             assert saved["cloudflare"]["executable"] == str(fake)
             assert saved["cloudflare"]["base_domain"] == "example.com"
-            assert saved["cloudflare"]["tunnels"]["web"]["credentials_file"] == str(credentials.resolve())
+            assert Path(saved["cloudflare"]["tunnels"]["web"]["credentials_file"]).samefile(credentials)
             assert (saved["token"], saved["login"], saved["device"]) == (original["token"], original["login"], original["device"])
             invalid = root / "invalid.json"
             invalid.write_text('{"TunnelID":"bad-id","TunnelSecret":"private-token-must-not-leak"}')
@@ -406,7 +391,8 @@ def main():
             cli("domain", "create", "example.com", "retry", "--json")
             assert sum(s["command"][0] == "create" for s in setups()) == creation_count
             for s in setups():
-                assert str(root.resolve()) in s["home"] and "cloudflare-managed" in s["home"]
+                assert Path(s["home"]).parent.parent.parent.samefile(root)
+                assert "cloudflare-managed" in s["home"]
                 assert s["token"] is None and s["force_dns"] is None
             assert "secret-must-not-leak" not in config.read_text()
             print("PASS browser authorization, isolated credentials, automated DNS and idempotent retries")
@@ -419,7 +405,7 @@ def main():
             capture = next(s for s in setups() if s["pid"] not in before)
             blocked = cli("domain", "create", "example.com", "blocked", ok=False)
             assert blocked.returncode != 0 and "another Cloudflare setup" in blocked.stderr
-            os.killpg(login.pid, signal.SIGINT); login.wait(timeout=5)
+            interrupt(login); login.wait(timeout=5)
             closed(capture)
             assert not (Path(capture["home"]) / ".cloudflared/cert.pem").exists()
             (root / "hold_login").unlink()
@@ -434,8 +420,8 @@ def main():
             share = start()
             share.event("live")
             capture = next(c for c in captures() if c["pid"] not in before)
-            assert json.loads((Path(capture["runtime"]) / "plan.json").read_text())["executable"] == str(fake.resolve())
-            os.killpg(share.process.pid, signal.SIGINT)
+            assert Path(json.loads((Path(capture["runtime"]) / "plan.json").read_text())["executable"]).samefile(fake)
+            interrupt(share.process)
             share.process.wait(timeout=5)
             closed(capture)
             cli("domain", "connect", "path.example.com", "--json")

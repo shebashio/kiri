@@ -24,15 +24,19 @@ jobs:
         include:
           - name: Linux x64
             runner: ubuntu-24.04
+            host: x86_64-unknown-linux-gnu
             artifact: kiri-linux-x64
           - name: Linux ARM64
             runner: ubuntu-24.04-arm
+            host: aarch64-unknown-linux-gnu
             artifact: kiri-linux-arm64
           - name: Windows x64
             runner: windows-2025
+            host: x86_64-pc-windows-msvc
             artifact: kiri-windows-x64
           - name: Windows ARM64
             runner: windows-11-arm
+            host: aarch64-pc-windows-msvc
             artifact: kiri-windows-arm64
     defaults:
       run:
@@ -45,9 +49,10 @@ jobs:
           persist-credentials: false
       - name: Install native Rust toolchain
         run: |
-          rustup update stable --no-self-update
-          rustup default stable
+          rustup toolchain install stable-${{ matrix.host }} --profile minimal --no-self-update
+          rustup default stable-${{ matrix.host }}
           rustc -vV
+          test "$(rustc -vV | sed -n 's/^host: //p' | tr -d '\r')" = '${{ matrix.host }}'
       - name: Install Linux desktop libraries
         if: runner.os == 'Linux'
         run: |
@@ -64,12 +69,19 @@ jobs:
         run: |
           cargo test --locked -p kiri --features window share::
           cargo test --locked -p kiri --features window ui::sharing::
-          python3 tests/cloudflare-share.py target/release/kiri
       - name: Test Windows sharing
         if: runner.os == 'Windows'
         run: |
           cargo test --locked -p kiri -p kiri-win share::
           cargo test --locked -p kiri-win sharing::
+      - name: Build native cloudflared test fixture
+        run: cargo build --locked -p kiri --example fake-cloudflared
+      - name: Test Linux tunnel lifecycle
+        if: runner.os == 'Linux'
+        run: python3 tests/cloudflare-share.py target/release/kiri target/debug/examples/fake-cloudflared
+      - name: Test Windows tunnel lifecycle
+        if: runner.os == 'Windows'
+        run: python tests/cloudflare-share.py target/release/kiri.exe target/debug/examples/fake-cloudflared.exe
       - name: Package Linux binaries
         if: runner.os == 'Linux'
         run: |

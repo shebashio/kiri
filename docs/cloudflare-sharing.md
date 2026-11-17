@@ -218,14 +218,18 @@ settings remain separate.
 ```sh
 cargo build -p kiri
 cargo test -p kiri share::
-python3 tests/cloudflare-share.py target/debug/kiri
+cargo build --locked -p kiri --example fake-cloudflared
+python3 tests/cloudflare-share.py target/debug/kiri target/debug/examples/fake-cloudflared
 python3 scripts/ui-test.py
 ```
 
 The lifecycle integration test uses a local fake cloudflared; it creates no
 public tunnel and needs no account. It covers browser authorization, tunnel
 and DNS creation, retries, cancellation, sharing, provider switches,
-environment-token isolation, executable discovery, and terminal Ctrl+C.
+environment-token isolation, executable discovery, and process termination
+(including terminal Ctrl+C on Unix). On Windows use `python` and append
+`.exe` to both binary paths. The native fixture uses the same subprocess
+supervisor as real cloudflared on each operating system.
 Settings changes preserve the saved Kiri login; `KIRI_SHARE_TOKEN` overrides
 authentication only for the current process and is never saved by those
 changes. A real custom-domain test requires authorizing a domain in your
