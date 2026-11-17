@@ -82,13 +82,15 @@ t version-api "1.47" $D version --format '{{.Server.APIVersion}}'
 # Engine version (Kiri's own beside it), the image's CMD for "Cmd": [], the
 # connection kept after a copy, log follow, one timestamp a line.
 t version-kiri-component "Kiri=" $D version --format '{{range .Server.Components}}{{.Name}}={{.Version}} {{end}}'
-for c in version cmd keepalive follow follow-created timestamps; do
+for c in version cmd keepalive follow follow-created timestamps exec; do
   t "testcontainers-$c" "ok $c" python3 "$(dirname "$0")/testcontainers-api.py" "$SOCK" "$c"
 done
 # Ryuk mounts the engine's socket and talks to it from inside.
 t socket-mount-reaches-kiri "Kiri" $D run --rm -v "$SOCK:/var/run/docker.sock" docker:cli docker version --format '{{.Server.Platform.Name}}'
 t info-os "Kiri" $D info --format '{{.OperatingSystem}}'
 t info-cgroup "2" $D info --format '{{.CgroupVersion}}'
+# Compose's `up` and `logs -f` read the daemon's time before they attach (#346).
+t info-system-time "$(date -u +%Y-%m-%dT)" $D info --format '{{.SystemTime}}'
 
 section "images"
 t pull-alpine "alpine:latest" $D pull alpine:latest
@@ -329,6 +331,20 @@ code network-dup 1 $D network create appnet
 $D rm -f db svc dnsbad >/dev/null
 t network-rm "appnet" $D network rm appnet
 code network-rm-builtin 1 $D network rm bridge
+# A network removed while an --init container runs frees its DNS address
+# for the next network on that subnet (#248).
+$D network create initnet >/dev/null
+initsub=$($D network inspect initnet -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}')
+$D run -d --name initnetc --network initnet alpine sleep 60 >/dev/null
+$D run -d --name initkeep --init alpine sleep 60 >/dev/null
+$D rm -f initnetc >/dev/null; $D network rm initnet >/dev/null
+$D network create initnet2 >/dev/null
+t network-rm-init-same-subnet "$initsub" $D network inspect initnet2 -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}'
+code network-rm-init-dns 0 $D run --rm --network initnet2 alpine true
+$D rm -f initkeep >/dev/null; $D network rm initnet2 >/dev/null
+# --init's PID 1 doesn't keep its own stdin open: cat sees the end of it
+# (a held one would leave cat to the timeout, exit 143).
+code init-stdin-eof 0 bash -c "echo x | $D run -i --rm --init alpine timeout 10 cat"
 # --internal: no default route, so anything beyond the network fails at once
 # (as with Docker), while the network itself still works.
 $D network create --internal intnet >/dev/null
@@ -576,6 +592,10 @@ t vol-copyup-owner "same:redis:redis 755" bash -c "i=\$($D run --rm redis:7-alpi
 t vol-copyup-tree "same" bash -c "i=\$($D run --rm alpine sh -c 'cd /etc/apk && { find . -exec stat -c \"%n %A %u %g\" {} +; find . -type f -exec md5sum {} +; } | sort | md5sum'); v=\$($D run --rm -v tapk:/etc/apk alpine sh -c 'cd /etc/apk && { find . -exec stat -c \"%n %A %u %g\" {} +; find . -type f -exec md5sum {} +; } | sort | md5sum'); [ \"\$i\" = \"\$v\" ] && echo same"
 t vol-copyup-not-over "1 mine" bash -c "$D run --rm -v tkeep:/usr/share/nginx/html nginx:alpine sh -c 'rm /usr/share/nginx/html/*; echo mine > /usr/share/nginx/html/mine' && $D run --rm -v tkeep:/usr/share/nginx/html nginx:alpine sh -c 'echo \$(ls /usr/share/nginx/html | wc -l) \$(cat /usr/share/nginx/html/mine)'"
 t redis-volume "PONG OK running" bash -c "$D run -d --name rv -v tredis:/data redis:7-alpine >/dev/null; for i in \$(seq 50); do $D exec rv redis-cli ping 2>/dev/null | grep -q PONG && break; sleep 0.2; done; p=\$($D exec rv redis-cli ping); s=\$($D exec rv redis-cli save); sleep 1; echo \$p \$s \$($D inspect -f '{{.State.Status}}' rv)"
+# A fresh named volume is filled from the image while the container starts.
+# `docker run -d` must not return before the container's root is in place, or
+# an immediate exec resolves users against the host's /etc/passwd (#311).
+t volume-user-ready "passed passed passed" bash -c "$D run --name ready-seed alpine sh -c 'adduser -D dev && mkdir /payload && dd if=/dev/zero of=/payload/blob bs=1M count=64' >/dev/null && $D commit -c 'USER dev' ready-seed kiri-test/ready:1 >/dev/null && $D rm -f ready-seed >/dev/null; for i in 1 2 3; do v=ready-vol-\$i; c=\$($D run -d --mount type=volume,source=\$v,target=/payload kiri-test/ready:1 sleep 60); if $D exec --user dev \$c id >/dev/null 2>&1; then printf 'passed '; else printf 'failed '; fi; $D rm -f \$c >/dev/null; $D volume rm \$v >/dev/null 2>&1; done; $D rmi kiri-test/ready:1 >/dev/null; echo"
 # A volume over part of a bind (`./:/app` and `/app/node_modules`) is filled
 # from the image, as Docker does, never from the host's folder under it.
 t vol-copyup-under-bind "index.html" bash -c "h=\$(mktemp -d); mkdir \$h/html; echo mac > \$h/html/from-host.txt; $D run --rm -v \$h:/usr/share/nginx -v /usr/share/nginx/html nginx:alpine sh -c 'cd /usr/share/nginx/html; [ -e from-host.txt ] && echo from the host || ls'; rm -rf \$h"
@@ -668,6 +688,69 @@ t compose-clean "0" bash -c "$D ps -aq --filter label=com.docker.compose.project
 t compose-bystander "bystander" $D ps --format '{{.Names}}'
 $D rm -f bystander >/dev/null
 rm -rf "$CP"
+
+section "healthchecks and a Compose dev stack (#358)"
+# Kiri runs healthchecks itself; Compose's depends_on conditions, --wait and
+# local bind volumes are built on them.
+$D run -d --name hc-ok --health-cmd true --health-interval 1s alpine sleep 120 >/dev/null
+$D run -d --name hc-bad --health-cmd 'exit 1' --health-interval 1s --health-retries 3 alpine sleep 120 >/dev/null
+$D run -d --name hc-slow --health-cmd 'sleep 5' --health-interval 1s --health-timeout 1s alpine sleep 120 >/dev/null
+$D run -d --name hc-start --health-cmd true --health-interval 30s --health-start-period 20s --health-start-interval 1s alpine sleep 120 >/dev/null
+sleep 5
+t health-healthy "healthy" $D inspect -f '{{.State.Health.Status}}' hc-ok
+t health-unhealthy "unhealthy" $D inspect -f '{{.State.Health.Status}}' hc-bad
+t health-streak "ok" bash -c "[ \$($D inspect -f '{{.State.Health.FailingStreak}}' hc-bad) -ge 3 ] && echo ok"
+t health-timeout "exceeded timeout (1s)" $D inspect -f '{{range .State.Health.Log}}{{.Output}}{{end}}' hc-slow
+t health-start-interval "healthy" $D inspect -f '{{.State.Health.Status}}' hc-start
+t health-filter-unhealthy "hc-bad" $D ps --filter health=unhealthy --format '{{.Names}}'
+t health-filter-healthy "hc-ok" $D ps --filter health=healthy --format '{{.Names}}'
+$D rm -f hc-ok hc-bad hc-slow hc-start >/dev/null
+HC=$(mktemp -d); mkdir -p "$HC/app" "$HC/shared"
+printf 'FROM alpine\nRUN echo built > /built\n' > "$HC/app/Dockerfile"
+cat > "$HC/compose.yaml" <<YAML
+services:
+  db:
+    image: alpine
+    command: [sh, -c, "sleep 2; touch /ready; date +%s > /tmp/t; sleep 300"]
+    healthcheck: {test: [CMD, test, -f, /ready], interval: 1s, retries: 30}
+  app:
+    build: ./app
+    command: [sh, -c, "date +%s > /shared/app-started; echo from-container > /shared/c.txt; sleep 300"]
+    depends_on: {db: {condition: service_healthy}}
+    volumes: [shared:/shared]
+volumes:
+  shared:
+    driver_opts: {type: none, o: bind, device: "$HC/shared"}
+YAML
+echo from-host > "$HC/shared/h.txt"
+t compose-wait "0" bash -c "cd $HC && $D compose -p kirihc up -d --build --wait >/dev/null 2>&1; echo \$?"
+t compose-db-healthy "healthy" bash -c "cd $HC && $D compose -p kirihc ps db --format '{{.Health}}'"
+t compose-built "built" bash -c "cd $HC && $D compose -p kirihc exec -T app cat /built"
+t compose-host-to-ctr "from-host" bash -c "cd $HC && $D compose -p kirihc exec -T app cat /shared/h.txt"
+t compose-ctr-to-host "from-container" cat "$HC/shared/c.txt"
+t compose-down-keeps "2" bash -c "cd $HC && $D compose -p kirihc down -v >/dev/null 2>&1; ls $HC/shared | grep -c txt"
+rm -rf "$HC"
+# A locked-down run, as hardened Compose services use.
+LOCK="$D run --rm --read-only --cap-drop ALL --security-opt no-new-privileges --init --network none --user 1000:1000 --tmpfs /x:uid=1000,gid=1000,mode=0700 alpine sh -c"
+t locked-tmpfs "1000 700" $LOCK "touch /x/f && stat -c '%u %a' /x"
+t locked-ro-root "Read-only" $LOCK "touch /y 2>&1"
+t locked-caps "CapEff:	0000000000000000" $LOCK "grep CapEff /proc/self/status"
+t locked-nnp "NoNewPrivs:	1" $LOCK "grep NoNewPrivs /proc/self/status"
+t locked-not-pid1 "ok" $LOCK 'test $$ -ne 1 && echo ok'
+# Only loopback may have an address, and nothing may lead out. (Some kernels, WSL 2's
+# among them, put unused tunnel devices such as tunl0 in every new network namespace.)
+t locked-only-lo "addresses=0 routes=0" $LOCK "echo addresses=\$(ip -o addr | grep -vc ' lo ') routes=\$(ip route | wc -l)"
+# A tmpfs volume's root keeps its uid=, gid= and mode= when the image has
+# nothing there to copy up (#296), on the first start and on a later one.
+$D volume create -d local -o type=tmpfs -o device=tmpfs -o o=size=1m,uid=10001,gid=10050,mode=2750 tv-owner >/dev/null
+t tmpfs-volume-owner "10001:10050 2750" $D run --rm -v tv-owner:/t alpine stat -c '%u:%g %a' /t
+$D create --name tv-again -v tv-owner:/t alpine stat -c '%u:%g %a' /t >/dev/null
+$D start -a tv-again >/dev/null 2>&1
+t tmpfs-volume-owner-restart "10001:10050 2750" $D start -a tv-again
+$D rm -f tv-again >/dev/null; $D volume rm tv-owner >/dev/null
+# ...and a volume over an image folder still gets that folder's owner.
+t volume-copy-up-owner "70:70" $D run --rm -v tv-pg:/var/lib/postgresql/data postgres:17-alpine stat -c '%u:%g' /var/lib/postgresql/data
+$D volume rm tv-pg >/dev/null 2>&1
 
 section "docker cp"
 CPD=$(mktemp -d); mkdir -p "$CPD/dir/sub"; echo one > "$CPD/a.txt"; echo two > "$CPD/dir/sub/b.txt"

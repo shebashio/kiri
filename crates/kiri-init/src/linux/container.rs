@@ -165,6 +165,10 @@ struct Prepared {
     init: bool,
     /// Ulimits, groups and device nodes from the `opts` lines.
     host: HostApplied,
+    /// The child's end of the pipe that says its root is in place (mounts
+    /// made, `pivot_root` done), so a start is not reported before an exec
+    /// can join its mount namespace (#311).
+    root_ready: Option<OwnedFd>,
 }
 
 /// The parts of [`super::hostopts::HostOpts`] the child applies itself.
@@ -340,6 +344,11 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
         prepared.net_ready = Some(r);
         go = Some(w);
     }
+    // The child says when its root and namespace are in place; a start that
+    // returns before that lets an immediate exec join the agent's root
+    // instead of the container's, where its image users don't exist (#311).
+    let (root_ready, child_root_ready) = sys::pipe().map_err(cleanup)?;
+    prepared.root_ready = Some(child_root_ready);
     let (parent_io, child_io) = stdio(&prepared).map_err(cleanup)?;
     let rootfs_c = sys::cstr(&rootfs).map_err(cleanup)?;
 
@@ -356,6 +365,9 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
     if pid == 0 {
         container_child(&prepared, &rootfs_c, &child_io);
     }
+    // The child holds its own copy of the write end: only then does closing
+    // it (the child exiting early) read as EOF here.
+    drop(prepared.root_ready.take());
     if flags & libc::CLONE_NEWNET as u64 != 0 {
         netns = fs::File::open(format!("/proc/{pid}/ns/net")).map_or(0, |f| netns_inode(&f));
     }
@@ -385,6 +397,24 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
             None => e,
         }
     };
+    // Do not report the start until the child's root is in place: before
+    // `pivot_root`, an exec joining its mount namespace gets the agent's
+    // `/etc/passwd`, and an image user such as `dev` is unknown (#311).
+    let mut ready = [0u8; 1];
+    let got = loop {
+        // SAFETY: reading one byte into a local buffer from a pipe we own.
+        let n = unsafe { libc::read(root_ready.as_raw_fd(), ready.as_mut_ptr().cast(), 1) };
+        if n >= 0 {
+            break n;
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(kill_child(e));
+        }
+    };
+    if got != 1 {
+        return Err(kill_child(io::Error::other("the container exited before its root was ready")));
+    }
     let mut veths = Vec::new();
     // Names, AAAA records and `--dns` servers to give the DNS server, once
     // nothing can fail any more: a failed start must not leave its names
@@ -488,7 +518,9 @@ fn plain_upper(base: &Path) -> io::Result<bool> {
         return Ok(true);
     }
     if fs::read_dir(base.join("upper"))?.next().is_some() {
-        return Ok(false);
+        // A mount that began at the same time may have marked it and
+        // written into it since this one looked for the marker.
+        return Ok(marker.exists());
     }
     fs::write(marker, b"")?;
     Ok(true)
@@ -862,6 +894,7 @@ fn prepare(argv: StrList<'_>, env: StrList<'_>, cwd: &str, user: &str, hostname:
         shm_size: 64 << 20,
         init: flags & run_flags::INIT != 0,
         host: HostApplied::default(),
+        root_ready: None,
     })
 }
 
@@ -1102,9 +1135,22 @@ fn apply_mount(root: BorrowedFd<'_>, image: Option<BorrowedFd<'_>>, m: &Mount) -
         // never from a bind mounted over it earlier (`./:/app` then
         // `/app/node_modules` must get the image's node_modules, not the
         // host's): looked up in the image's own tree when there is one.
-        let from = match image {
-            Some(img) => inroot::open(img, t, Last::Exists).ok(),
-            None => None,
+        // The image tree also holds the container's own layer, so it can show
+        // the folder Kiri just made (or made on an earlier start) for this
+        // mount. That isn't the image's: copying its root-owned 755 over the
+        // volume would undo a tmpfs volume's uid=, gid= and mode= (#296).
+        // So: when the lookup reaches the very folder this start created,
+        // it's marked and skipped; on later starts the mark skips it. The
+        // image's own folders have no mark, and one made inside an earlier
+        // bind (`./:/app` then `/app/node_modules`) is a different folder, so
+        // both still copy up as before.
+        let from = match image.and_then(|img| inroot::open(img, t, Last::Exists).ok()) {
+            Some(f) if at.created && same_dir(&f, &at) => {
+                mark_mountpoint(&target);
+                None
+            }
+            Some(f) if is_mountpoint_mark(&f.proc_path()) => None,
+            other => other,
         };
         let from_path = match &from {
             Some(f) => Some(f.proc_path()),
@@ -1128,6 +1174,29 @@ fn apply_mount(root: BorrowedFd<'_>, image: Option<BorrowedFd<'_>>, m: &Mount) -
         sys::mount(c"none", &at.proc_path(), c"none", libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_REC, None)?;
     }
     Ok(())
+}
+
+/// The xattr on a folder Kiri made in the container's layer to mount on.
+const MOUNTPOINT_MARK: &std::ffi::CStr = c"user.kiri.mountpoint";
+
+fn mark_mountpoint(dir: &std::ffi::CStr) {
+    // SAFETY: a valid NUL-terminated path and a one-byte value. A filesystem
+    // without user xattrs refuses it; the same-folder check still covers the
+    // first start then.
+    unsafe { libc::setxattr(dir.as_ptr(), MOUNTPOINT_MARK.as_ptr(), b"1".as_ptr().cast(), 1, 0) };
+}
+
+fn is_mountpoint_mark(dir: &std::ffi::CStr) -> bool {
+    let mut v = [0u8; 1];
+    // SAFETY: reads at most `v.len()` bytes into `v`.
+    unsafe { libc::getxattr(dir.as_ptr(), MOUNTPOINT_MARK.as_ptr(), v.as_mut_ptr().cast(), v.len()) >= 0 }
+}
+
+/// Both descriptors name the same folder (device and inode).
+fn same_dir(a: &inroot::Found, b: &inroot::Found) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let meta = |f: &inroot::Found| fs::metadata(Path::new(std::ffi::OsStr::from_bytes(f.proc_path().to_bytes())));
+    matches!((meta(a), meta(b)), (Ok(x), Ok(y)) if x.dev() == y.dev() && x.ino() == y.ino())
 }
 
 /// A detached copy of the current directory's mount (the container's
@@ -1258,6 +1327,13 @@ fn container_child(p: &Prepared, rootfs: &CStr, io: &ChildStdio) -> ! {
     }
     if p.net_none {
         sys::loopback_up().unwrap_or_else(|e| fail("loopback", e));
+    }
+    if let Some(done) = &p.root_ready {
+        // SAFETY: one byte to a pipe we own: root, mounts and namespaces
+        // are in place, so an exec can join them now.
+        if unsafe { libc::write(done.as_raw_fd(), b"r".as_ptr().cast(), 1) } != 1 {
+            fail("ready", io::Error::last_os_error());
+        }
     }
     if let Some(ready) = &p.net_ready {
         let mut b = [0u8; 1];

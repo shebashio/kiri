@@ -49,7 +49,15 @@ pub struct BootOptions {
 
 fn console_output(opts: &BootOptions) -> io::Result<Option<OwnedFd>> {
     if let Some(path) = &opts.console_log {
-        crate::diag::console::capture(path).map(Some)
+        // The log is for diagnosis: a log that can't be written (a full disk,
+        // a file made read-only) must not stop the VM booting.
+        match crate::diag::console::capture(path) {
+            Ok(fd) => Ok(Some(fd)),
+            Err(e) => {
+                crate::diag::warn!("guest console is not being saved", file = path.display(), error = e);
+                Ok(None)
+            }
+        }
     } else if opts.console {
         io::stdout().as_fd().try_clone_to_owned().map(Some)
     } else {
@@ -455,4 +463,15 @@ pub fn guest_dir() -> PathBuf {
         let repo = exe.as_ref().and_then(|e| e.ancestors().find(|d| d.join("Cargo.lock").is_file() && d.join("guest").is_dir()));
         repo.map(|r| r.join(built)).unwrap_or_else(|| PathBuf::from(built))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    // A console log that can't be written (a full disk, a read-only file)
+    // leaves the VM booting without one, not failing every request.
+    #[test]
+    fn an_unwritable_console_log_does_not_stop_the_boot() {
+        let opts = super::BootOptions { console_log: Some("/dev/null/guest-console.log".into()), ..Default::default() };
+        assert!(super::console_output(&opts).unwrap().is_none());
+    }
 }

@@ -6,6 +6,7 @@ pub mod archive;
 pub mod b64;
 pub mod cancel;
 mod connect;
+pub mod jsonfile;
 pub mod reference;
 pub mod registry;
 pub mod store;

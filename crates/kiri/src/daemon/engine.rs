@@ -490,6 +490,171 @@ struct Saved {
     health: Option<super::health::Health>,
 }
 
+/// What `load` reads of `containers.json`.
+struct Records {
+    saved: Vec<Saved>,
+    damage: Damage,
+    /// The damaged file's bytes when no copy of them could be kept: the
+    /// next save keeps a copy before it replaces the file.
+    pending_copy: Option<Vec<u8>>,
+    /// What is in `containers.json` after the read ([`fingerprint`]): what
+    /// was read, or the recovered list written over the damaged one.
+    on_disk: Option<(usize, u64)>,
+}
+
+/// Length and hash of a file's bytes, enough to tell whether it is the one
+/// this engine last read or wrote.
+fn fingerprint(bytes: &[u8]) -> (usize, u64) {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    (bytes.len(), h.finish())
+}
+
+/// How to restart the engine itself on this system, for the warning: the
+/// window's Stop and Quit leave it running.
+fn restart_hint() -> String {
+    if cfg!(target_os = "macos") {
+        format!("`launchctl kickstart -k gui/$(id -u)/{}`", crate::flavor::AGENT.get())
+    } else if std::path::Path::new("/run/systemd/system").exists() {
+        "`sudo systemctl restart kiri`".into()
+    } else if std::fs::read_to_string("/proc/sys/kernel/osrelease").is_ok_and(|r| r.to_ascii_lowercase().contains("microsoft")) {
+        "`wsl -d kiri -u root kiri-start --restart` in a Windows terminal".into()
+    } else {
+        "stop and start `kiri daemon`".into()
+    }
+}
+
+/// Why the container list may be missing containers. While any of it holds,
+/// nothing is deleted for not being in the list.
+///
+/// A list that could not be read in full says nothing about which folders
+/// belong to containers that are gone: the ones cut from it are still the
+/// person's. So this lasts as long as a `containers.json.corrupt-*` copy is
+/// kept beside the file, not just for the start that found the damage: a
+/// later clean start with a readable but short list would otherwise delete
+/// the same folders. Removing the copies (after putting back what they
+/// held, or deciding it is not needed) and restarting is what lets the
+/// engine tidy up again. Orphaned folders cost disk; deleting them on a
+/// guess could cost someone's data.
+#[derive(Clone, Debug, Default)]
+struct Damage {
+    /// Copies of damaged lists beside the file, oldest first.
+    copies: Vec<PathBuf>,
+    /// Why no copy of the damaged list could be kept: saves wait for one.
+    unsaved: Option<String>,
+    /// Why the folder could not be listed: copies there can't be ruled out.
+    unlistable: Option<String>,
+}
+
+impl Damage {
+    fn any(&self) -> bool {
+        !self.copies.is_empty() || self.unsaved.is_some() || self.unlistable.is_some()
+    }
+
+    /// One message for `docker info` and for what is refused because of
+    /// it: what happened, where the copies are, what is kept and refused,
+    /// and what ends it. True in each state; each copy named once.
+    fn message(&self, records: &std::path::Path) -> Option<String> {
+        if !self.any() {
+            return None;
+        }
+        let dir = records.parent().map(|d| d.display().to_string()).unwrap_or_default();
+        let mut m = Vec::new();
+        if let Some(e) = &self.unsaved {
+            m.push(format!("The container list in {dir} is damaged and no copy of it could be kept ({e}), so changes to containers are not saved until Kiri can write to that folder."));
+        }
+        let copies = self.copies.iter().map(|c| c.display().to_string()).collect::<Vec<_>>().join(", ");
+        match (self.copies.len(), self.unsaved.is_some()) {
+            (0, _) => {}
+            (1, false) => m.push(format!("The container list was damaged; a copy is kept at {copies}.")),
+            (_, false) => m.push(format!("The container list was damaged; copies are kept at {copies}.")),
+            (1, true) => m.push(format!("A copy of an earlier damaged list is kept at {copies}.")),
+            (_, true) => m.push(format!("Copies of earlier damaged lists are kept at {copies}.")),
+        }
+        if let Some(e) = &self.unlistable {
+            m.push(format!("Kiri cannot list {dir} ({e}), so it cannot tell whether a damaged container list was kept there."));
+        }
+        if self.unsaved.is_some() || !self.copies.is_empty() {
+            m.push("Containers missing from `docker ps -a` cannot be listed again, but their volumes are still there and their files and logs are kept on disk.".into());
+        }
+        let refuses = "Kiri deletes nothing on its own, and refuses volume, image and network prunes and removals of volumes and images without --force";
+        let mut until = Vec::new();
+        match self.copies.len() {
+            0 => {}
+            1 => until.push("the copy is removed"),
+            _ => until.push("the copies are removed"),
+        }
+        if self.unlistable.is_some() {
+            until.push("that folder can be listed");
+        }
+        if until.is_empty() {
+            m.push(format!("{refuses} until a copy can be kept."));
+        } else {
+            m.push(format!("{refuses} until {} and the engine itself is restarted ({}); then it tidies up and removes the files and logs of containers not in the list.", until.join(" and "), restart_hint()));
+        }
+        Some(m.join(" "))
+    }
+}
+
+/// Reads `containers.json`. One that does not parse is kept as a
+/// `containers.json.corrupt-*` copy, then replaced in one rename by its
+/// complete leading records, which are what is loaded: the list file is
+/// never missing. A missing file is an empty list; copies beside it still
+/// count as damage. Only a file that cannot be read at all is an error.
+fn read_records(path: &std::path::Path) -> io::Result<Records> {
+    use kiri_image::jsonfile;
+    jsonfile::remove_stale_temps(path);
+    let mut damage = Damage::default();
+    let mut pending_copy = None;
+    let mut made = None;
+    let mut on_disk = None;
+    let copies = jsonfile::kept_copies(path);
+    let saved = match std::fs::read(path) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(saved) => {
+                on_disk = Some(fingerprint(&bytes));
+                saved
+            }
+            Err(e) => {
+                let saved: Vec<Saved> = jsonfile::salvage(&bytes);
+                match jsonfile::keep_copy(path, &bytes) {
+                    Ok(copy) => {
+                        crate::diag::error!("container records unreadable: kept a copy and loaded what could be read",
+                            file = path.display(), copy = copy.display(), recovered = saved.len(), error = e);
+                        let written = serde_json::to_vec(&saved).map_err(io::Error::other)
+                            .and_then(|json| jsonfile::replace(path, &json, jsonfile::Durable::Now).map(|()| json));
+                        match written {
+                            Ok(json) => on_disk = Some(fingerprint(&json)),
+                            // Still the damaged bytes, which the copy holds.
+                            Err(err) => {
+                                on_disk = Some(fingerprint(&bytes));
+                                crate::diag::error!("the recovered container records were not written; the next save writes them", file = path.display(), error = err);
+                            }
+                        }
+                        made = Some(copy);
+                    }
+                    Err(err) => {
+                        crate::diag::error!("container records unreadable, and no copy could be kept: loaded what could be read; the list is not saved until a copy is kept",
+                            file = path.display(), recovered = saved.len(), error = e, copy_error = err);
+                        damage.unsaved = Some(err.to_string());
+                        pending_copy = Some(bytes);
+                    }
+                }
+                saved
+            }
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e),
+    };
+    match copies {
+        Ok(copies) => damage.copies = copies,
+        Err(e) => damage.unlistable = Some(e.to_string()),
+    }
+    damage.copies.extend(made);
+    Ok(Records { saved, damage, pending_copy, on_disk })
+}
+
 /// A container's healthcheck while it has one: its `State.Health`, and
 /// whether a monitor thread is probing. `epoch` changes whenever the monitor
 /// should stop, so a thread that sees a different one quits.
@@ -555,8 +720,25 @@ pub struct Engine {
     /// the same layers twice.
     layers: Mutex<()>,
     records: PathBuf,
-    /// Serialises writes of `containers.json`.
+    /// Serialises writes of `containers.json`. Taken before the engine's
+    /// state lock, never while holding it.
     saving: Mutex<()>,
+    /// Wakes the thread that syncs `containers.json` to disk after a save
+    /// (`start_syncer`); none once `shutdown` has stopped it.
+    syncer: Mutex<Option<Sender<()>>>,
+    /// Why the container list may be missing containers, found by `load`
+    /// (or by a save that kept a copy later): what `docker info` warns
+    /// about. While any of it holds nothing is deleted for not being in the
+    /// list (see [`Damage`]).
+    records_damage: Mutex<Damage>,
+    /// Length and hash of what is on disk as `containers.json` as far as
+    /// this engine knows (what it read at start, then what it wrote), kept
+    /// only while the list may be damaged: a save then keeps a file it did
+    /// not write as a copy before replacing it (`keep_foreign_copy`).
+    on_disk: Mutex<Option<(usize, u64)>>,
+    /// The damaged list's bytes while no copy of them could be kept: `save`
+    /// keeps them aside first, and replaces nothing until it could.
+    pending_copy: Mutex<Option<Vec<u8>>>,
     me: OnceLock<Weak<Engine>>,
     /// Containers that come back on Start: the ones whose restart policy
     /// would have started them when the daemon came up, held because Kiri
@@ -684,6 +866,10 @@ impl Engine {
             layers: Mutex::new(()),
             records,
             saving: Mutex::new(()),
+            records_damage: Mutex::new(Damage::default()),
+            pending_copy: Mutex::new(None),
+            on_disk: Mutex::new(None),
+            syncer: Mutex::new(None),
             me: OnceLock::new(),
             held_restarts: Mutex::new(Vec::new()),
             power: Mutex::new(()),
@@ -701,6 +887,7 @@ impl Engine {
             k8s_fwd: Mutex::new(HashMap::new()),
         });
         let _ = engine.me.set(Arc::downgrade(&engine));
+        engine.start_syncer();
         engine.load()?;
         engine.start_balloon();
         engine.start_cpu_meter();
@@ -710,6 +897,34 @@ impl Engine {
         #[cfg(target_os = "macos")]
         super::watch::start(Arc::downgrade(&engine));
         Ok(engine)
+    }
+
+    /// Why the container list may be missing containers, for `docker info`.
+    pub fn records_damage(&self) -> Vec<String> {
+        self.records_damage.lock().unwrap_or_else(|e| e.into_inner()).message(&self.records).into_iter().collect()
+    }
+
+    /// Whether nothing is deleted for not being in the container list.
+    fn keeps_everything(&self) -> bool {
+        self.records_damage.lock().unwrap_or_else(|e| e.into_inner()).any()
+    }
+
+    /// Why something must not be removed now that is removed for being
+    /// unused by every listed container (a prune, or a removal by name
+    /// without force, which the window sends for "Delete"): the list may be
+    /// missing containers that use it. `what` says what was not done, so
+    /// the text is true for the request it answers; the rest is the
+    /// `docker info` message. A forced removal is the person's call.
+    pub fn refusal(&self, what: &str) -> Option<String> {
+        let m = self.records_damage.lock().unwrap_or_else(|e| e.into_inner()).message(&self.records)?;
+        Some(format!("{what}. {m}"))
+    }
+
+    /// The containers whose folders the guest keeps at boot, everything
+    /// else on its disk being deleted; `None` when it must delete nothing
+    /// (the list may be missing containers).
+    fn guest_keeps(&self) -> Option<Vec<String>> {
+        (!self.keeps_everything()).then(|| self.lock().containers.keys().cloned().collect())
     }
 
     /// The running VM, booting it first if it is asleep (about 0.1 s).
@@ -760,7 +975,7 @@ impl Engine {
         self.boot_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let guest = crate::guest::Guest::boot(&crate::guest::BootOptions {
             data_disk: true,
-            console_log: Some(crate::diag::console::path()?),
+            console_log: crate::diag::console::path().ok(),
             memory_mib: Some(ceiling >> 20),
             cpus: Some(cpus),
             ..Default::default()
@@ -787,12 +1002,19 @@ impl Engine {
         if cfg!(target_os = "macos") {
             vm.listen(kiri_proto::DNS_RELAY_PORT, Box::new(super::dns::serve_relay))?;
         }
-        // Everything else on the guest's disk belongs to containers that are gone.
-        let keep: Vec<String> = self.lock().containers.keys().cloned().collect();
-        vm.retain(&keep)?;
+        // Everything else on the guest's disk belongs to containers that are
+        // gone, unless the container list was damaged: then a container
+        // missing from it may still be someone's, and so may the layers only
+        // it uses (its image may have been removed since).
+        let keep = self.guest_keeps();
+        match &keep {
+            Some(keep) => vm.retain(keep)?,
+            None => crate::diag::warn!("kept every container's files and layers: the container list was damaged"),
+        }
         // And every unpacked layer no image or container uses. Skipped if
         // the image list can't be read, rather than deleting everything.
         match self.store.images() {
+            _ if keep.is_none() => {}
             Ok(images) => {
                 let mut layers: std::collections::BTreeSet<String> = images.iter().flat_map(|i| i.layers.iter().map(|l| l.digest.clone())).collect();
                 layers.extend(self.lock().containers.values().flat_map(|c| c.layers.iter().cloned()));
@@ -1307,14 +1529,12 @@ impl Engine {
     /// Restores saved containers. Ones that were running when the daemon
     /// stopped are recorded as exited, as Docker does without live restore.
     fn load(&self) -> io::Result<()> {
-        let saved: Vec<Saved> = match std::fs::read(&self.records) {
-            Ok(b) => serde_json::from_slice(&b).unwrap_or_else(|e| {
-                crate::diag::error!("ignoring unreadable container records", file = self.records.display(), error = e);
-                Vec::new()
-            }),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => return Err(e),
-        };
+        let records = read_records(&self.records)?;
+        let keep_everything = records.damage.any();
+        *self.records_damage.lock().unwrap_or_else(|e| e.into_inner()) = records.damage;
+        *self.pending_copy.lock().unwrap_or_else(|e| e.into_inner()) = records.pending_copy;
+        *self.on_disk.lock().unwrap_or_else(|e| e.into_inner()) = records.on_disk.filter(|_| keep_everything);
+        let saved = records.saved;
         let now = SystemTime::now();
         let mut restart = Vec::new();
         {
@@ -1368,7 +1588,10 @@ impl Engine {
                 st.containers.insert(s.id, c);
             }
             // Logs of containers that are gone (`--rm` ones are never saved).
-            if let Ok(dirs) = std::fs::read_dir(self.store.root().join("containers")) {
+            // Not while the list may be missing some (`keep_everything`).
+            if keep_everything {
+                crate::diag::warn!("kept every container's logs: the container list was damaged");
+            } else if let Ok(dirs) = std::fs::read_dir(self.store.root().join("containers")) {
                 for d in dirs.flatten() {
                     if !d.file_name().to_str().is_some_and(|n| st.containers.contains_key(n)) {
                         let _ = std::fs::remove_dir_all(d.path());
@@ -1407,6 +1630,17 @@ impl Engine {
 
     /// Writes `containers.json`. `--rm` containers are left out.
     fn save(&self) {
+        // Taken before the snapshot, so saves land in the order their
+        // snapshots were taken: two saves racing could otherwise write an
+        // older snapshot last and undo a newer one.
+        let _one_writer = self.saving.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.keep_damaged_copy() {
+            return;
+        }
+        let watching = self.keeps_everything();
+        if watching && !self.keep_foreign_copy() {
+            return;
+        }
         let json = {
             let st = self.lock();
             let saved: Vec<Saved> = st
@@ -1433,10 +1667,108 @@ impl Engine {
             serde_json::to_vec(&saved)
         };
         let Ok(json) = json else { return };
-        let _one_writer = self.saving.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = self.records.with_extension("json.tmp");
-        if let Err(e) = std::fs::write(&tmp, &json).and_then(|()| std::fs::rename(&tmp, &self.records)) {
+        if let Err(e) = kiri_image::jsonfile::replace(&self.records, &json, kiri_image::jsonfile::Durable::Later) {
             crate::diag::error!("saving containers failed", error = e);
+            return;
+        }
+        if watching {
+            *self.on_disk.lock().unwrap_or_else(|e| e.into_inner()) = Some(fingerprint(&json));
+        }
+        // The file is complete and current now; making it durable (an fsync,
+        // about 5 ms on a Mac's disk) is left to the syncer, so container
+        // starts and stops never wait for the disk.
+        let syncer = self.syncer.lock().unwrap_or_else(|e| e.into_inner());
+        if syncer.as_ref().is_none_or(|tx| tx.send(()).is_err()) {
+            drop(syncer);
+            self.sync_records();
+        }
+    }
+
+    /// Before a save replaces a damaged list no copy of which could be kept
+    /// at the start, keeps it now. False while it still cannot: the save
+    /// then writes nothing, as replacing the file would lose the list.
+    /// Called with the save lock held.
+    fn keep_damaged_copy(&self) -> bool {
+        let mut pending = self.pending_copy.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(bytes) = pending.as_ref() else { return true };
+        match kiri_image::jsonfile::keep_copy(&self.records, bytes) {
+            Ok(copy) => {
+                crate::diag::warn!("kept a copy of the damaged container records", copy = copy.display());
+                let mut damage = self.records_damage.lock().unwrap_or_else(|e| e.into_inner());
+                damage.unsaved = None;
+                damage.copies.push(copy);
+                *self.on_disk.lock().unwrap_or_else(|e| e.into_inner()) = Some(fingerprint(bytes));
+                *pending = None;
+                true
+            }
+            Err(e) => {
+                self.records_damage.lock().unwrap_or_else(|e| e.into_inner()).unsaved = Some(e.to_string());
+                crate::diag::error!("container records not saved: the damaged list they would replace could not be kept aside", file = self.records.display(), error = e);
+                false
+            }
+        }
+    }
+
+    /// While the list may be damaged, a `containers.json` this engine did
+    /// not write (a person put a list back while it ran) is kept as a copy
+    /// before the save replaces it, so its content is never lost and the
+    /// next start still keeps everything. Called with the save lock held.
+    /// False when it could not be kept: the save then writes nothing.
+    fn keep_foreign_copy(&self) -> bool {
+        let Ok(bytes) = std::fs::read(&self.records) else { return true };
+        let on_disk = self.on_disk.lock().unwrap_or_else(|e| e.into_inner());
+        if *on_disk == Some(fingerprint(&bytes)) {
+            return true;
+        }
+        match kiri_image::jsonfile::keep_copy(&self.records, &bytes) {
+            Ok(copy) => {
+                crate::diag::warn!("the container list was changed outside Kiri: kept it as a copy before saving", copy = copy.display());
+                self.records_damage.lock().unwrap_or_else(|e| e.into_inner()).copies.push(copy);
+                true
+            }
+            Err(e) => {
+                crate::diag::error!("container records not saved: the list was changed outside Kiri and no copy of it could be kept", file = self.records.display(), error = e);
+                false
+            }
+        }
+    }
+
+    /// Syncs `containers.json` to disk.
+    fn sync_records(&self) {
+        if let Err(e) = kiri_image::jsonfile::sync(&self.records) {
+            crate::diag::error!("syncing containers to disk failed", error = e);
+        }
+    }
+
+    /// The thread that syncs `containers.json` after saves. It waits for a
+    /// quiet moment, `SYNC_QUIET` with no save, but no longer than
+    /// `SYNC_AT_MOST` while saves keep coming: on a Mac's disk a save made
+    /// while a sync runs waits for it, so syncing between saves of a burst
+    /// would slow every one of them. One sync covers every save made before
+    /// it starts. It ends when `shutdown` drops the sender (or the engine
+    /// goes), and `shutdown` then syncs one last time itself.
+    fn start_syncer(&self) {
+        const SYNC_QUIET: Duration = Duration::from_millis(100);
+        const SYNC_AT_MOST: Duration = Duration::from_secs(1);
+        let (tx, rx) = mpsc::channel::<()>();
+        let path = self.records.clone();
+        let spawned = std::thread::Builder::new().name("kiri-sync".into()).spawn(move || {
+            while rx.recv().is_ok() {
+                let first = std::time::Instant::now();
+                loop {
+                    let left = SYNC_AT_MOST.saturating_sub(first.elapsed());
+                    if left.is_zero() || !matches!(rx.recv_timeout(SYNC_QUIET.min(left)), Ok(())) {
+                        break;
+                    }
+                }
+                if let Err(e) = kiri_image::jsonfile::sync(&path) {
+                    crate::diag::error!("syncing containers to disk failed", error = e);
+                }
+            }
+        });
+        // Without the thread, save() syncs on the caller's thread.
+        if spawned.is_ok() {
+            *self.syncer.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
         }
     }
 
@@ -3229,12 +3561,17 @@ impl Engine {
         if removed.as_ref().is_some_and(|c| !c.spec.auto_remove) {
             self.save();
         }
-        // Lost containers are pruned by retain() on the next boot. Removal
-        // must not boot a replacement or wait for a retiring VM.
-        if removed.as_ref().is_some_and(|c| c.started.is_some() && !c.vm_stopped)
+        // Its writable layer is on the guest's disk, whether it ran in this
+        // boot, the one before a crash, or never started. Removal must not
+        // boot a replacement or wait for a retiring VM: while none is awake,
+        // retain() prunes the layer on the next boot.
+        // The container is already gone: a link that broke a moment ago
+        // doesn't make rm fail, retain() takes the layer on the next boot.
+        if removed.is_some()
             && let Some(vm) = self.awake()
+            && let Err(e) = vm.remove(&id)
         {
-            vm.remove(&id)?;
+            crate::diag::warn!("writable layer left for the next boot", id = id, error = e);
         }
         if with_volumes {
             for v in anon {
@@ -3290,6 +3627,9 @@ impl Engine {
         let users = self.volume_users(name);
         if !users.is_empty() && !force {
             return Err(Error::Conflict(format!("remove {name}: volume is in use - [{}]", users.join(", "))));
+        }
+        if !force && let Some(why) = self.refusal(&format!("Volume {name} was not removed, because the container list may be missing a container that uses it; `docker volume rm --force` removes it anyway")) {
+            return Err(Error::Conflict(why));
         }
         self.delete_volume_data(name);
         Ok(())
@@ -3514,6 +3854,11 @@ impl Engine {
                 crate::diag::warn!("the VM did not power off in 10 s; stopped it");
             }
         }
+        // The syncer stops; the last saves are synced here, and any save
+        // after this syncs on its own thread.
+        self.syncer.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let _one_writer = self.saving.lock().unwrap_or_else(|e| e.into_inner());
+        self.sync_records();
     }
 }
 
@@ -4475,5 +4820,410 @@ mod start_exit_tests {
         assert_eq!(super::start_exit_code(&io("exec /app: Permission denied (os error 13)")), 126);
         assert_eq!(super::start_exit_code(&format!("{:?}", super::Error::Conflict("no free address left on network n".into()))), 128);
         assert_eq!(super::start_exit_code(&format!("{:?}", super::Error::NotFound("network x not found".into()))), 128);
+    }
+}
+
+/// An engine that never boots a VM, for tests outside this file.
+#[cfg(test)]
+pub fn boot_without_vm(root: &std::path::Path) -> Arc<Engine> {
+    let engine = Engine::boot(Store::open(root).unwrap()).unwrap();
+    engine.stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+    engine
+}
+
+#[cfg(test)]
+mod records_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn image() -> Image {
+        Image {
+            name: "test:local".into(), digest: "sha256:test".into(), index_digest: None, config_digest: "sha256:test".into(),
+            layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
+        }
+    }
+
+    fn boot(root: &Path) -> Arc<Engine> {
+        let engine = Engine::boot(Store::open(root).unwrap()).unwrap();
+        // Nothing here may boot a real VM.
+        engine.stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+        engine
+    }
+
+    fn listed(engine: &Engine) -> Vec<String> {
+        let mut ids: Vec<String> = engine.lock().containers.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    /// A store with three stopped containers, each with a log folder, and a
+    /// log folder no record names. Returns the root, the ids in the file's
+    /// order and the good file's bytes.
+    fn fixture(name: &str) -> (PathBuf, Vec<String>, Vec<u8>) {
+        let root = std::env::temp_dir().join(format!("kiri-records-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let engine = boot(&root);
+        for n in ["c1", "c2", "c3"] {
+            let spec: Spec = serde_json::from_value(serde_json::json!({
+                "image": "test:local", "image_id": "sha256:test", "entrypoint": [], "cmd": ["true"],
+                "env": [], "cwd": "/", "user": "", "auto_remove": false, "network_mode": "none", "labels": {},
+                "restart": {"name": "no", "max_retries": 0}
+            })).unwrap();
+            let id = engine.create(Some(n.into()), spec, &image()).unwrap();
+            engine.lock().containers.get_mut(&id).unwrap().status = Status::Exited;
+        }
+        engine.save();
+        drop(engine);
+        let bytes = std::fs::read(root.join("containers.json")).unwrap();
+        let saved: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        let ids: Vec<String> = saved.iter().map(|s| s["id"].as_str().unwrap().to_owned()).collect();
+        for id in ids.iter().map(String::as_str).chain(["orphan"]) {
+            let d = super::super::logfile::dir(&root, id);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("log"), "line-one\n").unwrap();
+        }
+        (root, ids, bytes)
+    }
+
+    fn logs_kept(root: &Path, ids: &[String]) -> bool {
+        ids.iter().map(String::as_str).chain(["orphan"]).all(|id| super::super::logfile::dir(root, id).join("log").exists())
+    }
+
+    /// Where each record ends in a file written by `save`: `[r1,r2,r3]`.
+    fn record_ends(bytes: &[u8]) -> Vec<usize> {
+        let saved: Vec<serde_json::Value> = serde_json::from_slice(bytes).unwrap();
+        let mut at = 1;
+        saved.iter().map(|r| { at += serde_json::to_vec(r).unwrap().len() + 1; at - 1 }).collect()
+    }
+
+    #[test]
+    fn a_good_file_round_trips_and_tidies_up() {
+        let (root, ids, _) = fixture("good");
+        let engine = boot(&root);
+        let mut want = ids.clone();
+        want.sort();
+        assert_eq!(listed(&engine), want);
+        let mut names: Vec<String> = ids.iter().map(|id| engine.lock().containers[id].name.clone()).collect();
+        names.sort();
+        assert_eq!(names, ["c1", "c2", "c3"]);
+        assert!(ids.iter().all(|id| engine.lock().containers[id].status == Status::Exited));
+        assert!(!engine.keeps_everything());
+        assert!(engine.records_damage().is_empty());
+        assert!(kiri_image::jsonfile::kept_copies(&engine.records).unwrap().is_empty());
+        // A log folder no record names is a container that is gone.
+        assert!(!super::super::logfile::dir(&root, "orphan").exists());
+        assert!(ids.iter().all(|id| super::super::logfile::dir(&root, id).exists()));
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn names_on_disk(root: &Path) -> Vec<String> {
+        let saved: Vec<serde_json::Value> = serde_json::from_slice(&std::fs::read(root.join("containers.json")).unwrap()).unwrap();
+        let mut names: Vec<String> = saved.iter().map(|s| s["name"].as_str().unwrap().to_owned()).collect();
+        names.sort();
+        names
+    }
+
+    /// One message, true in each state, listing the copies once, never
+    /// advising to put a list back, and saying how the engine itself is
+    /// restarted here.
+    #[test]
+    fn the_warning_says_what_happened_and_what_ends_it() {
+        let records = Path::new("/s/containers.json");
+        let restart = restart_hint();
+        assert_eq!(Damage::default().message(records), None);
+        let refused = "refuses volume, image and network prunes and removals of volumes and images without --force";
+        let copies = Damage { copies: vec!["/s/containers.json.corrupt-1-0".into(), "/s/containers.json.corrupt-2-0".into()], ..Default::default() };
+        let m = copies.message(records).unwrap();
+        for want in ["copies are kept at /s/containers.json.corrupt-1-0, /s/containers.json.corrupt-2-0", "cannot be listed again", "their volumes are still there", "files and logs are kept on disk", refused, "until the copies are removed and the engine itself is restarted", &restart, "removes the files and logs of containers not in the list"] {
+            assert!(m.contains(want), "{want:?} in {m}");
+        }
+        assert_eq!(m.matches("corrupt-1-0").count(), 1, "each copy once: {m}");
+        assert!(!m.contains("back"), "no advice to put a list back: {m}");
+        let unsaved = Damage { unsaved: Some("Permission denied".into()), ..Default::default() };
+        let m = unsaved.message(records).unwrap();
+        assert!(m.contains("changes to containers are not saved until Kiri can write to that folder") && m.contains("Permission denied") && m.contains("until a copy can be kept") && !m.contains("tidies up"), "{m}");
+        let unlistable = Damage { unlistable: Some("Permission denied".into()), ..Default::default() };
+        let m = unlistable.message(records).unwrap();
+        assert!(m.contains("cannot list /s") && m.contains("until that folder can be listed and the engine itself is restarted") && !m.contains("cannot be listed again"), "{m}");
+        if cfg!(target_os = "macos") {
+            assert!(restart.contains("launchctl kickstart -k"), "{restart}");
+        }
+    }
+
+    /// The reviewer's sequence: damage, start, a person moves another list
+    /// onto containers.json while the engine runs, a save happens, the
+    /// engine starts again. The person's file is kept as a copy, everything
+    /// is still kept, and nothing is swept.
+    #[test]
+    fn a_list_put_back_while_the_engine_runs_is_kept_as_a_copy() {
+        let (root, ids, good) = fixture("putback");
+        let file = root.join("containers.json");
+        std::fs::write(&file, &good[..good.len() / 2]).unwrap();
+        let engine = boot(&root);
+        assert!(engine.keeps_everything());
+        assert_eq!(kiri_image::jsonfile::kept_copies(&file).unwrap().len(), 1);
+        // Put back by hand: written beside it, moved over it.
+        let theirs = root.join("theirs.json");
+        std::fs::write(&theirs, &good).unwrap();
+        std::fs::rename(&theirs, &file).unwrap();
+        engine.save();
+        let copies = kiri_image::jsonfile::kept_copies(&file).unwrap();
+        assert_eq!(copies.len(), 2, "the file put back is kept as a copy");
+        assert!(copies.iter().any(|c| std::fs::read(c).unwrap() == good), "with its content");
+        // A save of the engine's own file keeps nothing more.
+        engine.save();
+        assert_eq!(kiri_image::jsonfile::kept_copies(&file).unwrap().len(), 2);
+        drop(engine);
+        let engine = boot(&root);
+        assert!(engine.keeps_everything());
+        assert!(logs_kept(&root, &ids), "nothing swept at the next start");
+        assert_eq!(engine.guest_keeps(), None);
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_guest_deletes_nothing_while_the_list_is_damaged() {
+        let (root, ids, good) = fixture("guest");
+        let engine = boot(&root);
+        let mut keep = engine.guest_keeps().expect("a good list: the guest tidies up");
+        keep.sort();
+        let mut want = ids.clone();
+        want.sort();
+        assert_eq!(keep, want);
+        drop(engine);
+        std::fs::write(root.join("containers.json"), &good[..good.len() / 2]).unwrap();
+        let engine = boot(&root);
+        assert_eq!(engine.guest_keeps(), None, "a damaged list: the guest keeps every folder and layer");
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stale_temporary_files_go_at_start() {
+        let (root, _, _) = fixture("temps");
+        let stale = root.join("containers.json.4242.7.tmp");
+        std::fs::write(&stale, b"[").unwrap();
+        let engine = boot(&root);
+        assert!(!stale.exists());
+        assert!(!engine.keeps_everything());
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// No list file, but copies beside it: an empty list with everything
+    /// kept, never the copies' containers (an old copy would bring back
+    /// containers removed long ago).
+    #[test]
+    fn with_no_list_but_a_copy_nothing_is_loaded_and_nothing_deleted() {
+        let (root, ids, good) = fixture("copyonly");
+        let file = root.join("containers.json");
+        std::fs::write(root.join("containers.json.corrupt-100-0"), &good).unwrap();
+        std::fs::remove_file(&file).unwrap();
+        let engine = boot(&root);
+        assert!(listed(&engine).is_empty(), "the copy is not loaded");
+        assert!(engine.keeps_everything());
+        assert!(logs_kept(&root, &ids));
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Damage found at this start keeps everything even when the folder
+    /// cannot be listed (mode 0300: entries can be made and renamed, not
+    /// read), and a folder that cannot be listed counts as damage itself.
+    #[cfg(unix)]
+    #[test]
+    fn an_unlistable_folder_still_keeps_everything() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, ids, good) = fixture("unlistable");
+        let file = root.join("containers.json");
+        let mode = |m: u32| std::fs::set_permissions(&root, std::fs::Permissions::from_mode(m)).unwrap();
+        mode(0o300);
+        if std::fs::read_dir(&root).is_ok() {
+            mode(0o755);
+            eprintln!("skipped: permissions do not apply to this user");
+            return;
+        }
+        // (b) a good list, but no way to look for copies: damage.
+        let engine = boot(&root);
+        assert!(engine.keeps_everything(), "an unlistable folder counts as damage");
+        drop(engine);
+        // (a) a damaged list moved aside at this very start.
+        std::fs::write(&file, &good[..10]).unwrap();
+        let engine = boot(&root);
+        assert!(engine.keeps_everything());
+        assert!(engine.records_damage().iter().any(|w| w.contains("containers.json.corrupt-")), "{:?}", engine.records_damage());
+        drop(engine);
+        mode(0o755);
+        assert!(logs_kept(&root, &ids));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A folder that refuses changes at the first start (mode 0500): the
+    /// damaged list can be neither moved nor copied. Nothing replaces it
+    /// until a copy is kept; once the folder takes changes again, the next
+    /// save keeps the copy first, then writes the list.
+    #[cfg(unix)]
+    #[test]
+    fn a_damaged_list_is_never_replaced_before_a_copy_is_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, ids, good) = fixture("readonly");
+        let ends = record_ends(&good);
+        let file = root.join("containers.json");
+        let damaged = good[..ends[0] + 5].to_vec();
+        std::fs::write(&file, &damaged).unwrap();
+        let mode = |m: u32| std::fs::set_permissions(&root, std::fs::Permissions::from_mode(m)).unwrap();
+        mode(0o500);
+        if std::fs::write(root.join("probe"), b"").is_ok() {
+            mode(0o755);
+            eprintln!("skipped: permissions do not apply to this user");
+            return;
+        }
+        let engine = boot(&root);
+        assert_eq!(listed(&engine), vec![ids[0].clone()], "the readable record is loaded");
+        assert!(engine.keeps_everything());
+        engine.lock().containers.get_mut(&ids[0]).unwrap().name = "renamed".into();
+        engine.save();
+        assert_eq!(std::fs::read(&file).unwrap(), damaged, "no save replaces the only copy");
+        mode(0o755);
+        engine.save();
+        let copies = kiri_image::jsonfile::kept_copies(&file).unwrap();
+        assert_eq!(copies.len(), 1);
+        assert_eq!(std::fs::read(&copies[0]).unwrap(), damaged, "the copy holds the damaged list");
+        assert_eq!(names_on_disk(&root), ["renamed"], "then the list is written");
+        assert!(engine.records_damage().iter().any(|w| w.contains(&*copies[0].to_string_lossy())));
+        assert!(logs_kept(&root, &ids));
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The list on disk is current as soon as save returns, with the sync
+    /// left to the syncer thread, and also once that thread is gone (as
+    /// after shutdown, which is not called here: it ends every engine in
+    /// the process).
+    #[test]
+    fn saves_are_current_at_once_with_or_without_the_syncer() {
+        let (root, ids, _) = fixture("syncer");
+        let engine = boot(&root);
+        let names = || -> Vec<String> {
+            let saved: Vec<serde_json::Value> = serde_json::from_slice(&std::fs::read(root.join("containers.json")).unwrap()).unwrap();
+            saved.iter().map(|s| s["name"].as_str().unwrap().to_owned()).collect()
+        };
+        assert!(engine.syncer.lock().unwrap().is_some(), "the syncer runs");
+        engine.lock().containers.get_mut(&ids[0]).unwrap().name = "renamed".into();
+        engine.save();
+        assert!(names().contains(&"renamed".to_owned()));
+        engine.syncer.lock().unwrap().take();
+        engine.lock().containers.get_mut(&ids[0]).unwrap().name = "after".into();
+        engine.save();
+        assert!(names().contains(&"after".to_owned()));
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_damaged_file_is_kept_recovered_and_deletes_nothing() {
+        let (root, ids, good) = fixture("damaged");
+        let ends = record_ends(&good);
+        let file = root.join("containers.json");
+        // (bytes, how many records can still be read)
+        let cases: Vec<(Vec<u8>, usize)> = vec![
+            (Vec::new(), 0),
+            (good[..10].to_vec(), 0),
+            (good[..ends[0]].to_vec(), 1),
+            (good[..ends[0] + 7].to_vec(), 1),
+            (good[..ends[1] + 1].to_vec(), 2),
+            (good[..good.len() / 2].to_vec(), ends.iter().filter(|e| **e <= good.len() / 2).count()),
+            (good[..good.len() - 1].to_vec(), 3),
+            (b"\0\0\0garbage".to_vec(), 0),
+        ];
+        for (bytes, recovered) in cases {
+            std::fs::write(&file, &bytes).unwrap();
+            let engine = boot(&root);
+            let copies = kiri_image::jsonfile::kept_copies(&file).unwrap();
+            assert_eq!(copies.len(), 1, "one copy kept");
+            assert_eq!(std::fs::read(&copies[0]).unwrap(), bytes, "the copy holds the damaged bytes");
+            let mut want = ids[..recovered].to_vec();
+            want.sort();
+            assert_eq!(listed(&engine), want, "cut at {}: the complete leading records are loaded", bytes.len());
+            assert!(engine.keeps_everything());
+            let damage = engine.records_damage();
+            assert!(damage.iter().any(|w| w.contains(&*copies[0].to_string_lossy())), "{damage:?}");
+            assert!(logs_kept(&root, &ids), "no log folder is deleted");
+            // What was recovered is written back, readable.
+            let rewritten: Vec<serde_json::Value> = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+            assert_eq!(rewritten.len(), recovered);
+            drop(engine);
+
+            // The next start reads a good, shorter list: still nothing goes,
+            // since the copy says containers may be missing from it.
+            let engine = boot(&root);
+            assert!(engine.keeps_everything());
+            assert!(logs_kept(&root, &ids), "no log folder is deleted at the next clean start");
+            drop(engine);
+            std::fs::remove_file(&copies[0]).unwrap();
+        }
+        // With the copies removed, the engine tidies up again.
+        std::fs::write(&file, &good).unwrap();
+        let engine = boot(&root);
+        assert!(!engine.keeps_everything());
+        assert!(!super::super::logfile::dir(&root, "orphan").exists());
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod save_speed_tests {
+    use super::*;
+
+    /// Many saves back to back from several threads (a compose up, a burst
+    /// of exits) cost about what writing the file costs: syncing it to disk
+    /// must not make each save wait. On a Mac's disk a sync takes 5 ms or
+    /// more, so a save that waits for one is many times slower than the
+    /// write itself.
+    #[test]
+    fn back_to_back_saves_stay_close_to_the_unsynced_write() {
+        let root = std::env::temp_dir().join(format!("kiri-save-speed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let engine = Engine::boot(Store::open(&root).unwrap()).unwrap();
+        engine.stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+        let image = Image {
+            name: "test:local".into(), digest: "sha256:test".into(), index_digest: None, config_digest: "sha256:test".into(),
+            layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
+        };
+        for i in 0..20 {
+            let spec: Spec = serde_json::from_value(serde_json::json!({
+                "image": "test:local", "image_id": "sha256:test", "entrypoint": [], "cmd": ["true"],
+                "env": [], "cwd": "/", "user": "", "auto_remove": false, "network_mode": "none", "labels": {},
+                "restart": {"name": "no", "max_retries": 0}
+            })).unwrap();
+            engine.create(Some(format!("speed{i}")), spec, &image).unwrap();
+        }
+        let (threads, each) = (8, 100);
+        // The same number of plain writes of the same file: temp file, rename.
+        let bytes = std::fs::read(root.join("containers.json")).unwrap();
+        let plain = root.join("plain.json");
+        let t = std::time::Instant::now();
+        for _ in 0..threads * each {
+            let tmp = root.join("plain.json.tmp");
+            std::fs::write(&tmp, &bytes).unwrap();
+            std::fs::rename(&tmp, &plain).unwrap();
+        }
+        let unsynced = t.elapsed();
+        let t = std::time::Instant::now();
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| (0..each).for_each(|_| engine.save()));
+            }
+        });
+        let saves = t.elapsed();
+        eprintln!("{} saves from {threads} threads: {saves:?}; the same writes unsynced: {unsynced:?}", threads * each);
+        // Loose, for other tests' disk work running alongside: waiting for
+        // a sync per save is 30 to 40 times the unsynced write on a Mac.
+        assert!(saves < unsynced * 8 + Duration::from_millis(500), "{saves:?} for saves against {unsynced:?} unsynced");
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

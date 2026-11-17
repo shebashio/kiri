@@ -46,6 +46,14 @@ impl Request {
         self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v.as_str())
     }
 
+    /// The client asked to close the connection after this response
+    /// (`Connection: close`), as Docker.DotNet does on every request. Docker
+    /// closes then; a client that reads a 204 to the end of the stream waits
+    /// for that close and times out if it never comes.
+    pub fn wants_close(&self) -> bool {
+        self.header("Connection").is_some_and(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("close")))
+    }
+
     /// A request the daemon makes of itself (the managed builder's
     /// container create), so it goes through the same code as a client's.
     pub fn internal(method: &str, path: &str, query: &[(&str, &str)], body: Vec<u8>) -> Request {
@@ -370,6 +378,21 @@ pub fn upgrade(w: &mut impl Write) -> io::Result<()> {
     w.flush()
 }
 
+/// Starts the raw stream for Docker's `attach` and `exec` start. As Docker
+/// does (it checks that the `Upgrade` header is present, not its value), a
+/// client that asked for the upgrade (the docker CLI) gets `101`; one that did
+/// not (docker-java, so Testcontainers) gets `200 OK` with the stream as the
+/// body. A `101` to a client that never asked for it can end its read before
+/// the process's exit code is recorded, and it then sees an exec with no
+/// `ExitCode`.
+pub fn upgrade_if_asked(req: &Request, w: &mut impl Write) -> io::Result<()> {
+    if req.header("Upgrade").is_some() {
+        return upgrade(w);
+    }
+    head(w, 200, "Content-Type: application/vnd.docker.raw-stream\r\n")?;
+    w.flush()
+}
+
 /// Docker's multiplexed stream framing: `[stream, 0, 0, 0, len u32 BE] data`.
 pub fn mux_frame(w: &mut impl Write, stream: u8, data: &[u8]) -> io::Result<()> {
     let mut header = [0u8; 8];
@@ -383,6 +406,27 @@ pub fn mux_frame(w: &mut impl Write, stream: u8, data: &[u8]) -> io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn with_connection(value: Option<&str>) -> Request {
+        let headers = value.map(|v| vec![("connection".to_owned(), v.to_owned())]).unwrap_or_default();
+        Request { method: "POST".to_owned(), path: "/containers/x/start".to_owned(), query: Vec::new(), headers, body: Vec::new() }
+    }
+
+    /// Docker.DotNet sends `Connection: close` on every request and reads a
+    /// 204 to the end of the stream: the connection must close after it.
+    #[test]
+    fn connection_close_is_asked_for_in_any_case_and_list() {
+        assert!(with_connection(Some("close")).wants_close());
+        assert!(with_connection(Some("Close")).wants_close());
+        assert!(with_connection(Some("keep-alive, close")).wants_close());
+    }
+
+    #[test]
+    fn keep_alive_or_no_header_keeps_the_connection() {
+        assert!(!with_connection(Some("keep-alive")).wants_close());
+        assert!(!with_connection(Some("Upgrade")).wants_close());
+        assert!(!with_connection(None).wants_close());
+    }
 
     #[test]
     fn strips_api_version() {
@@ -433,5 +477,27 @@ mod tests {
         assert_eq!(path_of("/images/a+b/json"), "/images/a+b/json");
         // An invalid escape stays written, as in query values.
         assert_eq!(path_of("/images/100%/json"), "/images/100%/json");
+    }
+
+    /// `attach` and `exec` start answer `101` only to a client that asked to
+    /// upgrade (the docker CLI). docker-java, so Testcontainers, does not, and
+    /// gets `200 OK` with the raw stream as the body, as from Docker.
+    #[test]
+    fn upgrades_only_when_asked() {
+        let reply = |headers: Vec<(String, String)>| {
+            let req = Request { method: "POST".into(), path: "/exec/x/start".into(), query: Vec::new(), headers, body: Vec::new() };
+            let mut out = Vec::new();
+            upgrade_if_asked(&req, &mut out).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        let asked = reply(vec![("Upgrade".into(), "tcp".into()), ("Connection".into(), "Upgrade".into())]);
+        assert!(asked.starts_with("HTTP/1.1 101 "), "{asked}");
+        assert!(asked.contains("Upgrade: tcp\r\n"), "{asked}");
+        let other = reply(vec![("upgrade".into(), "h2c".into())]);
+        assert!(other.starts_with("HTTP/1.1 101 "), "{other}");
+        let plain = reply(Vec::new());
+        assert!(plain.starts_with("HTTP/1.1 200 OK\r\n"), "{plain}");
+        assert!(plain.contains("Content-Type: application/vnd.docker.raw-stream\r\n"), "{plain}");
+        assert!(!plain.contains("Upgrade"), "{plain}");
     }
 }

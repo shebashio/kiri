@@ -908,9 +908,15 @@ fn admit(conn: &mut File, dns: &mut super::dns::Dns, procs: &mut HashMap<libc::p
         let mut out = Vec::new();
         for (stream, fd) in [(Stream::Stdout, old.run.stdout.take()), (Stream::Stderr, old.run.stderr.take())] {
             let Some(fd) = fd else { continue };
+            // Only what is in the pipe already. A process the old one left
+            // behind in a session of its own can still hold the write end:
+            // a read that waited for it would hold up every container.
+            if sys::set_nonblocking(fd.as_raw_fd()).is_err() {
+                continue;
+            }
             loop {
-                // SAFETY: reading into a buffer we own from a non-blocking
-                // descriptor we own.
+                // SAFETY: reading into a buffer we own from a descriptor we
+                // own, made non-blocking just above.
                 let got = unsafe { libc::read(fd.as_raw_fd(), chunk.as_mut_ptr().cast(), chunk.len()) };
                 if got <= 0 {
                     break;
@@ -1019,6 +1025,40 @@ mod running_tests {
         assert!(super::read_frame(&mut host, &mut frame).unwrap());
         assert!(matches!(kiri_proto::decode(&frame), Ok(Msg::Exited(e)) if e.id == "old" && e.code == 3), "then its exit");
         assert!(!super::read_frame(&mut host, &mut frame).unwrap(), "nothing about the new one");
+    }
+
+    /// A process the old one left behind, in a session of its own, can keep
+    /// the old one's output pipe open for as long as it lives.
+    #[test]
+    fn a_new_process_on_a_freed_pid_does_not_wait_for_a_pipe_still_held() {
+        use kiri_proto::Msg;
+        use std::io::Write;
+        // Made as `container::stdio` makes a process's stdout.
+        let (out_r, out_w) = super::super::sys::pipe().unwrap();
+        let mut held = std::fs::File::from(out_w);
+        held.write_all(b"bye").unwrap();
+        let (done, waited) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let (mut host, mut conn) = pipe();
+            let mut dns = super::super::dns::Dns::default();
+            let mut procs = HashMap::new();
+            let mut old = new_proc(Process::for_test("old", 100), 0, 0);
+            old.run.stdout = Some(out_r);
+            old.exited = Some((3, 0));
+            procs.insert(100, old);
+            super::admit(&mut conn, &mut dns, &mut procs, new_proc(Process::for_test("new", 100), 0, 0)).unwrap();
+            drop(conn);
+            let mut frame = Vec::new();
+            let last_words = super::read_frame(&mut host, &mut frame).unwrap() && matches!(kiri_proto::decode(&frame), Ok(Msg::Output { id: "old", data: b"bye", .. }));
+            let exit = super::read_frame(&mut host, &mut frame).unwrap() && matches!(kiri_proto::decode(&frame), Ok(Msg::Exited(e)) if e.id == "old" && e.code == 3);
+            let _ = done.send((last_words, exit, procs[&100].run.id.clone()));
+        });
+        let got = waited.recv_timeout(std::time::Duration::from_secs(5));
+        // Only now does the pipe close: a read still waiting for it ends,
+        // so the thread can be joined whatever happened.
+        drop(held);
+        thread.join().unwrap();
+        assert_eq!(got, Ok((true, true, "new".to_owned())), "the old one's last output and exit go out, and nothing waits for the pipe to close");
     }
 }
 

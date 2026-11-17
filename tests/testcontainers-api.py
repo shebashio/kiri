@@ -2,7 +2,7 @@
 """What Testcontainers (docker-java, .NET, Go) needs of the engine API, asked
 the way those clients ask: raw HTTP/1.1 on one kept-alive connection.
 
-    tests/testcontainers-api.py SOCKET [version|cmd|keepalive|follow|follow-created|timestamps ...]
+    tests/testcontainers-api.py SOCKET [version|cmd|keepalive|follow|follow-created|timestamps|exec ...]
 
 Prints one line per check, "ok <name>" or "FAIL <name>: why", and exits 1 if
 any failed. The containers it makes (tc-api-*) are left running.
@@ -46,10 +46,10 @@ class Conn:
         out, self.buf = self.buf[:n], self.buf[n:]
         return out
 
-    def send(self, method, path, body=None, ctype="application/json"):
+    def send(self, method, path, body=None, ctype="application/json", extra=""):
         if isinstance(body, (dict, list)):
             body = json.dumps(body).encode()
-        head = f"{method} /v1.32{path} HTTP/1.1\r\nHost: localhost:2375\r\nAccept: application/json\r\n"
+        head = f"{method} /v1.32{path} HTTP/1.1\r\nHost: localhost:2375\r\nAccept: application/json\r\n{extra}"
         if body is not None:
             head += f"Content-Type: {ctype}\r\nContent-Length: {len(body)}\r\n"
         self.s.sendall(head.encode() + b"\r\n" + (body or b""))
@@ -212,9 +212,54 @@ def check_timestamps():
     return "one RFC 3339 stamp"
 
 
+def exec_start(c, cid, cmd, extra=""):
+    """Creates an exec and starts it on the same connection; returns the exec
+    id, the reply's status and headers, and everything it streamed to EOF."""
+    status, _, reply = c.request("POST", f"/containers/{cid}/exec", {"AttachStdout": True, "AttachStderr": True, "Cmd": cmd})
+    assert status == 201, f"exec create {status} {reply[:200]!r}"
+    eid = json.loads(reply)["Id"]
+    c.send("POST", f"/exec/{eid}/start", {"Detach": False, "Tty": False}, extra=extra)
+    status, headers = c.head()
+    out = c.buf
+    c.buf = b""
+    try:
+        while True:
+            chunk = c.s.recv(65536)
+            if not chunk:
+                break
+            out += chunk
+    except socket.timeout:
+        raise AssertionError("the exec's stream never closed")
+    return eid, status, headers, out
+
+
+def check_exec():
+    # docker-java's execInContainer (MongoDBContainer's rs.initiate) sends no
+    # Upgrade header. Docker answers 200 with the stream as the body, closed
+    # when the exec ends; a 101 there made the client stop early and read an
+    # exec with no ExitCode. The docker CLI asks for the upgrade and gets 101.
+    c = Conn()
+    cid = fresh(c, "tc-api-exec", ["sleep", "600"])
+    status, _, reply = c.request("POST", f"/containers/{cid}/start")
+    assert status == 204, f"start {status} {reply[:200]!r}"
+    eid, status, headers, out = exec_start(c, cid, ["sh", "-c", "echo out; exit 3"])
+    assert status == 200, f"exec start without Upgrade answered {status}"
+    assert "upgrade" not in headers, f"Upgrade header in a 200: {headers}"
+    assert headers.get("content-type") == "application/vnd.docker.raw-stream", headers.get("content-type")
+    assert b"out\n" in out, f"stream {out!r}"
+    c2 = Conn()
+    _, _, reply = c2.request("GET", f"/exec/{eid}/json")
+    info = json.loads(reply)
+    assert info["Running"] is False and info["ExitCode"] == 3, f"after the stream closed: {info}"
+    _, status, headers, _ = exec_start(Conn(), cid, ["true"], extra="Connection: Upgrade\r\nUpgrade: tcp\r\n")
+    assert status == 101 and headers.get("upgrade") == "tcp", f"with Upgrade: tcp: {status} {headers}"
+    return "200 without Upgrade, ExitCode set at EOF; 101 with it"
+
+
 CHECKS = {
     "version": check_version, "cmd": check_cmd, "keepalive": check_keepalive,
     "follow": check_follow, "follow-created": check_follow_created, "timestamps": check_timestamps,
+    "exec": check_exec,
 }
 
 if __name__ == "__main__":

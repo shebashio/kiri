@@ -33,6 +33,7 @@ pub fn serve(stream: UnixStream, engine: Arc<Engine>) -> io::Result<()> {
             engine.touch();
         }
         match route(&req, &engine, &mut w, &mut r) {
+            Ok(Next::KeepAlive) if req.wants_close() => return Ok(()),
             Ok(Next::KeepAlive) => {}
             Ok(Next::Close) => return Ok(()),
             Err(e) => {
@@ -226,7 +227,7 @@ fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufRea
                 return reply(w, image_tag(req, engine, name).map(|()| Value::Null), 201);
             }
         } else if m == "DELETE" {
-            return reply(w, image_remove(engine, rest), 200);
+            return reply(w, image_remove(engine, rest, req.flag("force")), 200);
         }
     }
     if let Some(rest) = p.strip_prefix("/containers/") {
@@ -436,6 +437,8 @@ fn info(engine: &Engine) -> Value {
         "DefaultRuntime": "kiri",
         "Runtimes": {"kiri": {"path": "kiri-init"}},
         "SecurityOptions": ["name=seccomp,profile=builtin", "name=cgroupns"],
+        // Compose needs it to attach in `up` and `logs -f` (#346).
+        "SystemTime": time::rfc3339(std::time::SystemTime::now()),
         // Not in Docker's /info (the ping's Builder-Version header is), but
         // tools print it: the classic builder API, served by builder.rs.
         "BuilderVersion": "1",
@@ -448,7 +451,7 @@ fn info(engine: &Engine) -> Value {
         "KiriMemoryStall": engine.memory_trouble().0,
         "KiriOomKills": engine.memory_trouble().1,
         "KiriCpuPercent": engine.cpu_percent(),
-        "Warnings": [],
+        "Warnings": engine.records_damage(),
     })
 }
 
@@ -525,7 +528,7 @@ fn image_inspect(engine: &Engine, name: &str) -> Result<Value, Error> {
     }))
 }
 
-fn image_remove(engine: &Engine, name: &str) -> Result<Value, Error> {
+fn image_remove(engine: &Engine, name: &str, force: bool) -> Result<Value, Error> {
     let i = engine.image(name)?.ok_or_else(|| Error::NotFound(format!("No such image: {name}")))?;
     // With another tag on the same image, removing this one only untags it.
     let other_tags = engine.store.images()?.iter().any(|o| o.config_digest == i.config_digest && o.name != i.name);
@@ -534,6 +537,14 @@ fn image_remove(engine: &Engine, name: &str) -> Result<Value, Error> {
         return Err(Error::Conflict(format!(
             "conflict: unable to remove repository reference \"{name}\" (must force) - container {c} is using its referenced image"
         )));
+    }
+    // The last tag takes the image: no listed container uses it, but while
+    // the list may be missing some, only a forced removal goes ahead.
+    if !other_tags
+        && !force
+        && let Some(why) = engine.refusal(&format!("Image {name} was not removed, because the container list may be missing a container that uses it; `docker rmi --force` removes it anyway"))
+    {
+        return Err(Error::Conflict(why));
     }
     engine.store.remove_image(&i.name)?;
     engine.emit_image("untag", &i.config_digest, &i.name);
@@ -1284,6 +1295,11 @@ fn volume_create(req: &Request, engine: &Engine) -> Result<Value, Error> {
 /// Docker's default prune: anonymous volumes no container uses.
 /// `all=true` takes named ones too.
 fn volume_prune(req: &Request, engine: &Engine) -> Result<Value, Error> {
+    // While the container list may be missing containers, "unused" can't
+    // be told; say so rather than quietly pruning less.
+    if let Some(why) = engine.refusal("Volumes were not pruned, because the container list may be missing containers that use them") {
+        return Err(Error::Conflict(why));
+    }
     let f = filters(req, &["label", "label!", "all"])?;
     let all = f.bool("all") == Some(true);
     let unused: Vec<String> = engine
@@ -2204,6 +2220,11 @@ fn network_create(req: &Request, engine: &Engine) -> Result<Value, Error> {
 }
 
 fn network_prune(req: &Request, engine: &Engine) -> Result<Value, Error> {
+    // While the container list may be missing containers, "unused" can't
+    // be told; say so rather than quietly pruning less.
+    if let Some(why) = engine.refusal("Networks were not pruned, because the container list may be missing containers that use them") {
+        return Err(Error::Conflict(why));
+    }
     let f = filters(req, &["label", "label!"])?;
     let nets = engine.lock_net();
     let unused: Vec<String> = nets
@@ -2249,7 +2270,7 @@ fn attach(req: &Request, engine: &Arc<Engine>, key: &str, w: &mut UnixStream, r:
             return Ok(Next::KeepAlive);
         }
     };
-    http::upgrade(w)?;
+    http::upgrade_if_asked(req, w)?;
     if want_in {
         forward_stdin(engine.clone(), id, r)?;
     }
@@ -2370,7 +2391,7 @@ fn exec_start(req: &Request, engine: &Arc<Engine>, id: &str, w: &mut UnixStream,
         http::no_content(w)?;
         return Ok(Next::KeepAlive);
     }
-    http::upgrade(w)?;
+    http::upgrade_if_asked(req, w)?;
     if stdin {
         forward_stdin(engine.clone(), id.to_owned(), r)?;
     }
@@ -2759,6 +2780,111 @@ pub(super) fn parse_signal(raw: &str) -> Result<u32, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An engine whose container list was damaged (a kept copy is there),
+    /// with a named volume and a network no listed container uses: they may
+    /// be a lost container's, so prune removes neither and says why.
+    #[test]
+    fn prune_removes_nothing_while_the_container_list_is_damaged() {
+        let root = std::env::temp_dir().join(format!("kiri-prune-damaged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("containers.json.corrupt-1-0"), b"[{\"id\":").unwrap();
+        let engine = super::super::engine::boot_without_vm(&root);
+        engine.volume_ensure_with("lost-data", json!({}), Default::default()).unwrap();
+        engine.lock_net().create("lost-net", Default::default()).unwrap();
+        let req = Request::internal("POST", "/volumes/prune", &[("filters", r#"{"all":["true"]}"#)], Vec::new());
+        match volume_prune(&req, &engine) {
+            Err(Error::Conflict(why)) => assert!(why.starts_with("Volumes were not pruned") && why.contains("containers.json.corrupt-1-0"), "{why}"),
+            other => panic!("volume prune: {other:?}"),
+        }
+        assert!(engine.volume_get("lost-data").is_some(), "the volume is kept");
+        match network_prune(&Request::internal("POST", "/networks/prune", &[], Vec::new()), &engine) {
+            Err(Error::Conflict(why)) => assert!(why.starts_with("Networks were not pruned") && why.contains("containers.json.corrupt-1-0"), "{why}"),
+            other => panic!("network prune: {other:?}"),
+        }
+        assert!(engine.lock_net().find("lost-net").is_some(), "the network is kept");
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn engine_in(name: &str, damaged: bool) -> (std::path::PathBuf, std::sync::Arc<Engine>) {
+        let root = std::env::temp_dir().join(format!("kiri-rm-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        if damaged {
+            std::fs::write(root.join("containers.json.corrupt-1-0"), b"[{\"id\":").unwrap();
+        }
+        let engine = super::super::engine::boot_without_vm(&root);
+        (root, engine)
+    }
+
+    fn test_image(name: &str) -> kiri_image::Image {
+        kiri_image::Image {
+            name: name.into(), digest: "sha256:0123".into(), index_digest: None, config_digest: "sha256:0123".into(),
+            layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
+        }
+    }
+
+    /// A container using `volume` and `image`, in the list.
+    fn listed_user(engine: &Engine, volume: &str, image: &kiri_image::Image) {
+        let spec: super::super::engine::Spec = serde_json::from_value(json!({
+            "image": image.name, "image_id": image.config_digest, "entrypoint": [], "cmd": ["true"],
+            "env": [], "cwd": "/", "user": "", "auto_remove": false, "network_mode": "none", "labels": {},
+            "restart": {"name": "no", "max_retries": 0}, "volumes": [volume]
+        })).unwrap();
+        engine.create(Some("user".into()), spec, image).unwrap();
+    }
+
+    /// On a good list removal by name is as before: one a listed container
+    /// uses is refused, one none uses goes.
+    #[test]
+    fn removal_by_name_on_a_good_list_is_unchanged() {
+        let (root, engine) = engine_in("good", false);
+        let image = test_image("used:1");
+        engine.store.put_image(image.clone()).unwrap();
+        engine.volume_ensure_with("used", json!({}), Default::default()).unwrap();
+        engine.volume_ensure_with("free", json!({}), Default::default()).unwrap();
+        listed_user(&engine, "used", &image);
+        assert!(matches!(engine.volume_remove("used", false), Err(Error::Conflict(m)) if m.contains("volume is in use")));
+        engine.volume_remove("free", false).unwrap();
+        assert!(engine.volume_get("free").is_none());
+        assert!(matches!(image_remove(&engine, "used:1", false), Err(Error::Conflict(m)) if m.contains("is using its referenced image")));
+        engine.store.put_image(test_image("free:1")).unwrap();
+        engine.store.put_image(kiri_image::Image { config_digest: "sha256:4567".into(), ..test_image("other:1") }).unwrap();
+        image_remove(&engine, "other:1", false).unwrap();
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// On a damaged list a volume or image no listed container uses may be
+    /// a lost container's (the window's Delete sends exactly this request):
+    /// refused unless forced, and still there. Forced, it goes.
+    #[test]
+    fn removal_by_name_on_a_damaged_list_needs_force() {
+        let (root, engine) = engine_in("damaged", true);
+        engine.volume_ensure_with("lost-data", json!({}), Default::default()).unwrap();
+        match engine.volume_remove("lost-data", false) {
+            Err(Error::Conflict(why)) => assert!(why.starts_with("Volume lost-data was not removed") && why.contains("containers.json.corrupt-1-0"), "{why}"),
+            other => panic!("volume rm: {other:?}"),
+        }
+        assert!(engine.volume_get("lost-data").is_some(), "the volume is kept");
+        engine.volume_remove("lost-data", true).unwrap();
+        assert!(engine.volume_get("lost-data").is_none(), "forced, it goes");
+        engine.store.put_image(test_image("lost:1")).unwrap();
+        match image_remove(&engine, "lost:1", false) {
+            Err(Error::Conflict(why)) => assert!(why.starts_with("Image lost:1 was not removed") && why.contains("containers.json.corrupt-1-0"), "{why}"),
+            other => panic!("rmi: {other:?}"),
+        }
+        assert_eq!(engine.store.images().unwrap().len(), 1, "the image is kept");
+        // Untagging, with another tag left, deletes nothing: allowed.
+        engine.store.put_image(test_image("lost:2")).unwrap();
+        image_remove(&engine, "lost:2", false).unwrap();
+        image_remove(&engine, "lost:1", true).unwrap();
+        assert!(engine.store.images().unwrap().is_empty(), "forced, it goes");
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn kernel_release_is_trimmed_and_empty_is_none() {
